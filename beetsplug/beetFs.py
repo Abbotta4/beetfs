@@ -40,6 +40,7 @@ from mutagen.flac import (FLAC, Padding, MetadataBlock, VCFLACDict, CueSheet,
                           SeekTable, FLACNoHeaderError, FLACVorbisError)
 from mutagen.id3 import ID3, BitPaddedInt, MakeID3v1
 from mutagen._util import insert_bytes
+from functools import reduce
 
 PATH_FORMAT = ("$artist/$album ($year) [$format_upper]/"
                "$track - $artist - $title.$format")
@@ -76,7 +77,7 @@ METADATA_FIELDS = [
     ('bitrate', 'int'),
 ] + METADATA_RW_FIELDS
 
-METADATA_KEYS = map(operator.itemgetter(0), METADATA_FIELDS)
+METADATA_KEYS = list(map(operator.itemgetter(0), METADATA_FIELDS))
 
 
 def template_mapping(lib, item):
@@ -86,7 +87,7 @@ def template_mapping(lib, item):
         value = getattr(item, key)
         # sanitize the value for inclusion in a path:
         # replace / and leading . with _
-        if isinstance(value, basestring):
+        if isinstance(value, str):
             value.replace(os.sep, '_')
             value = re.sub(r'[\\/:]|^\.', '_', value)
         elif key in ('track', 'tracktotal', 'disc', 'disctotal'):
@@ -140,7 +141,7 @@ def mount(lib, config, opts, args):
     directory_structure = FSNode({}, {})
 
     # iterate over items in library
-    for item in lib.items():
+    for item in list(lib.items()):
         # build the template map
         mapping = template_mapping(lib, item)
 
@@ -178,7 +179,7 @@ def mount(lib, config, opts, args):
     server.multithreaded = 0
     try:
         server.main()
-    except fuse.FuseError, e:
+    except fuse.FuseError as e:
         log.error(str(e))
 
 
@@ -194,7 +195,7 @@ class beetFs(BeetsPlugin):
 def to_int_be(string):
     """Convert an arbitrarily-long string to a long using big-endian
     byte order."""
-    return reduce(lambda a, b: (a << 8) + ord(b), string, 0L)
+    return reduce(lambda a, b: (a << 8) + ord(b), string, 0)
 
 
 class InterpolatedID3 (ID3):
@@ -209,9 +210,9 @@ class InterpolatedID3 (ID3):
         """
         # Sort frames by 'importance'
         order = ["TIT2", "TPE1", "TRCK", "TALB", "TPOS", "TDRC", "TCON"]
-        order = dict(zip(order, range(len(order))))
+        order = dict(list(zip(order, list(range(len(order))))))
         last = len(order)
-        frames = self.items()
+        frames = list(self.items())
         frames.sort(lambda a, b: cmp(order.get(a[0][:4], last),
                     order.get(b[0][:4], last)))
 
@@ -252,7 +253,7 @@ class InterpolatedID3 (ID3):
 
             try:
                 f.seek(-128, 2)
-            except IOError, err:
+            except IOError as err:
                 if err.errno != EINVAL:
                     raise
                 f.seek(0, 2)  # ensure read won't get "TAG"
@@ -431,9 +432,9 @@ class FSNode(object):
             elements = []
         node = self.getnode(elements, root=root)
         if directories:
-            return node.dirs.keys()
+            return list(node.dirs.keys())
         else:
-            return node.files.keys()
+            return list(node.files.keys())
 
 
 class FileHandler(object):
@@ -651,7 +652,7 @@ class beetFileSystem(fuse.Fuse):
         try:
             if path == "/":
                 logging.info("Returning /")
-                mode = stat.S_IFDIR | 0755
+                mode = stat.S_IFDIR | 0o755
                 st = Stat(st_mode=mode, st_size=Stat.DIRSIZE, st_nlink=2)
                 return st
             else:
@@ -697,7 +698,7 @@ class beetFileSystem(fuse.Fuse):
                         return -errno.ENOENT
                     else:
                         logging.info("gotdir")
-                        mode = stat.S_IFDIR | 0544
+                        mode = stat.S_IFDIR | 0o544
                         st = Stat(st_mode=mode, st_size=Stat.DIRSIZE,
                                   st_nlink=2)
                         return st

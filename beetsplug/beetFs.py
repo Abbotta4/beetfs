@@ -117,7 +117,7 @@ def template_mapping(lib, item):
     return mapping
 
 
-def mount(lib, config, opts, args):
+def mount(lib, opts, args):
     # check we have a command line argument
     if not args:
         raise beets.ui.UserError('no mountpoint specified')

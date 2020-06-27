@@ -1,2 +1,14 @@
 *~
 \#*\#
+bin
+lib
+lib64
+share
+pyvenv.cfg
+config.yaml
+library.db
+state.pickle
+beets.log
+beetsplug/*
+!beetsplug/beetfs.py
+!beetsplug/_find_fuse_parts.py

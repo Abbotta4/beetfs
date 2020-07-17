@@ -1,5 +1,6 @@
 *~
 \#*\#
+.env
 bin
 lib
 lib64
@@ -8,6 +9,7 @@ pyvenv.cfg
 config.yaml
 library.db
 state.pickle
+beetfs.log
 beets.log
 beetsplug/*
 !beetsplug/beetfs.py

@@ -121,14 +121,17 @@ class BeetFuse(fuse.Fuse):
         st = Stat()
         path_split = path.split('/')[1:]
         if len(path_split) == len(PATH_FORMAT_SPLIT): # file
-            beet_item = library.get_item(fs_tree.find('mount_path', path).beet_id)
-            _st = os.stat(beet_item.get('path'))
-            st.st_mode = stat.S_IFREG | 0o444
+            item_node = fs_tree.find('mount_path', path)
+            if not item_node:
+                return -errno.ENOENT
+            beet_item = library.get_item(item_node.beet_id)
+            _st = os.stat(beet_item.path)
+            st.st_mode = stat.S_IFREG | 0o644
             st.st_nlink = 1
             st.st_size = _st.st_size
             BEETFS_LOG.info("getattr: file")
         else: # dir
-            st.st_mode = stat.S_IFDIR | 0o555
+            st.st_mode = stat.S_IFDIR | 0o755
             st.st_nlink = 2
             st.st_size = Stat.DIR_ST_SIZE
             BEETFS_LOG.info("getattr: dir")
@@ -150,8 +153,14 @@ class BeetFuse(fuse.Fuse):
 
     def open(self, path, flags):
         BEETFS_LOG.info("open on " + path)
-        return -errno.ENOSYS
+        return 0
 
     def read(self, path, size, offset):
         BEETFS_LOG.info("read on " + path)
-        return -errno.ENOSYS
+        item_node = fs_tree.find('mount_path', path)
+        if not item_node:
+            return -errno.ENOENT
+        beet_item = library.get_item(item_node.beet_id)
+        with open(beet_item.path, 'rb') as ufile:
+            ufile.seek(offset)
+            return ufile.read(size)

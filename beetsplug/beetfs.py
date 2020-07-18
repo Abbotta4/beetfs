@@ -1,9 +1,4 @@
 import os, stat, errno, datetime, fuse, logging, sys
-# pull in some spaghetti to make this stuff work without fuse-py being installed
-try:
-    import _find_fuse_parts
-except ImportError:
-    pass
 from beets import config as Config
 from beets.plugins import BeetsPlugin
 from beets.ui import Subcommand

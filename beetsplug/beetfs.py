@@ -63,6 +63,8 @@ def build_fs_tree(library):
         cursor = root
         for depth in range(0, height):
             name = item.evaluate_template(PATH_FORMAT_SPLIT[depth])
+            if depth == height - 1: # file
+                name += os.path.splitext(item.path)[-1].decode('utf-8') # add extension
             beet_id = item.id
             mount_path = cursor.mount_path + '/' + name
             child = TreeNode(name, beet_id, mount_path, cursor)

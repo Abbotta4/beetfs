@@ -1,16 +1,12 @@
-import os, stat, errno, datetime, fuse, logging, sys
-from beets import config as Config
-from beets.plugins import BeetsPlugin
-from beets.ui import Subcommand
+import os, stat, errno, datetime, pyfuse3, trio, logging
+from beets import config
+from beets.plugins import BeetsPlugin as beetsplugin
+from beets.ui import Subcommand as subcommand
 
-PATH_FORMAT = Config['paths']['default'].get()
+PATH_FORMAT = config['paths']['default'].get() # %first{$albumartist}/$album ($year)/$track $title
 PATH_FORMAT_SPLIT = PATH_FORMAT.split('/')
 
-if not hasattr(fuse, '__version__'):
-    raise RuntimeError("your fuse-py doesn't know of fuse.__version__, probably it's too old.")
-
-fuse.fuse_python_api = (0, 2)
-
+# TODO: see how other plugins do this
 def logging_setup(filename):
     global BEET_LOG, BEETFS_LOG_FILENAME, BEETFS_LOG
     logger = logging.getLogger('beetfs')
@@ -22,63 +18,32 @@ def logging_setup(filename):
     logger.addHandler(ch)
     return logger
 
-BEETFS_LOG_FILENAME = 'beetfs.log'
-BEETFS_LOG = logging_setup(BEETFS_LOG_FILENAME)
+BEETFS_LOG = logging_setup('beetfs.log')
 BEET_LOG = logging.getLogger('beets')
 
-def log_excepthook(etype, e, tb):
-    BEETFS_LOG.info(e)
-    for x in tb.format_tb():
-        BEETFS_LOG.info(x)
-sys.excepthook = log_excepthook
-
 def mount(lib, opts, args):
-    global library, fs_tree
+    global library
     library = lib
-    fs_tree = build_fs_tree(library)
-    """
-    for f in fs_tree.children:
-        print(f.name)
-        for g in f.children:
-            print(g.name)
-            for h in g.children:
-                print(h.name)
-    print("PATH_FORMAT = ", PATH_FORMAT)
-    """
-    usage = "where and when will this print?"
-    server = BeetFuse(version="%prog " + fuse.__version__,
-                     usage=usage,
-                     dash_s_do='setsingle')
-    server.parse(errex=1)
-    server.main()
+    beetfs = Operations()
+    fuse_options = set(pyfuse3.default_options)
+    fuse_options.add('fsname=beetfs')
+    pyfuse3.init(beetfs, args[0], fuse_options)
+    try:
+        trio.run(pyfuse3.main)
+    except:
+        pyfuse3.close()
+        raise
 
-mount_command = Subcommand('mount', help='mount a beets filesystem')
+    pyfuse3.close()
+
+mount_command = subcommand('mount', help='mount a beets filesystem')
 mount_command.func = mount
 
-def build_fs_tree(library):
-    items = list(library.items())
-    root = TreeNode()
-    height = len(PATH_FORMAT_SPLIT)
-    for item in items:
-        cursor = root
-        for depth in range(0, height):
-            name = item.evaluate_template(PATH_FORMAT_SPLIT[depth])
-            if depth == height - 1: # file
-                name += os.path.splitext(item.path)[-1].decode('utf-8') # add extension
-            beet_id = item.id
-            mount_path = cursor.mount_path + '/' + name
-            child = TreeNode(name, beet_id, mount_path, cursor)
-            cursor = cursor.add_child(child)
-    return root
-
-class BeetFs(BeetsPlugin):
-    def commands(self):
-        return [mount_command]
-
 class TreeNode():
-    def __init__(self, name='', beet_id=-1, mount_path='', parent=None):
+    def __init__(self, name='', inode=1, beet_id=-1, mount_path='', parent=None):
         BEETFS_LOG.info("Creating node " + str(name))
         self.name = name
+        self.inode = inode
         self.beet_id = beet_id
         self.mount_path = mount_path
         self.parent = parent
@@ -86,83 +51,106 @@ class TreeNode():
 
     def add_child(self, child):
         for _child in self.children:
-            if _child.name == child.name:
+            if _child.name == child.name: # match by name?
                 return _child
-        else:
-            self.children.append(child)
-            return child
+        self.children.append(child)
+        return child
 
-    def find(self, attr, target): # linear search :(
-        BEETFS_LOG.info("Searching for " + attr + " == " + target)
+    def find(self, attr, target): # DFS
+        BEETFS_LOG.info("Searching for {} == {}".format(attr, target))
         if getattr(self, attr) == target:
             return self
         for child in self.children:
             result = child.find(attr, target)
             if result:
                 return result
+            
+class beetfs(beetsplugin):
+    def commands(self):
+        return [mount_command]
 
-class Stat(fuse.Stat):
-    DIR_ST_SIZE = os.stat('.').st_size # is this bad to do?
-    UID = os.getuid()
-    GID = os.getgid()
+class Operations(pyfuse3.Operations):
+    enable_writeback_cache = True
     def __init__(self):
-        self.st_mode = 0
-        self.st_ino = 0
-        self.st_dev = 0
-        self.st_nlink = 0
-        self.st_uid = self.UID
-        self.st_gid = self.GID
-        self.st_size = 0
-        self.st_atime = 0
-        self.st_mtime = 0
-        self.st_ctime = 0
+        super(Operations, self).__init__()
+        self.next_inode = pyfuse3.ROOT_INODE + 1
+        self.tree = self._build_fs_tree()
 
-class BeetFuse(fuse.Fuse):
-    def getattr(self, path):
-        BEETFS_LOG.info("getattr on " + path)
-        st = Stat()
-        path_split = path.split('/')[1:]
-        if len(path_split) == len(PATH_FORMAT_SPLIT): # file
-            item_node = fs_tree.find('mount_path', path)
-            if not item_node:
-                return -errno.ENOENT
-            beet_item = library.get_item(item_node.beet_id)
-            _st = os.stat(beet_item.path)
-            st.st_mode = stat.S_IFREG | 0o644
-            st.st_nlink = 1
-            st.st_size = _st.st_size
-            BEETFS_LOG.info("getattr: file")
-        else: # dir
-            st.st_mode = stat.S_IFDIR | 0o755
-            st.st_nlink = 2
-            st.st_size = Stat.DIR_ST_SIZE
-            BEETFS_LOG.info("getattr: dir")
-        return st
+    def _build_fs_tree(self):
+        items = list(library.items())
+        root = TreeNode()
+        height = len(PATH_FORMAT_SPLIT)
+        for item in items:
+            cursor = root
+            for depth in range(0, height):
+                name = item.evaluate_template(PATH_FORMAT_SPLIT[depth])
+                if depth == height - 1: # file
+                    name += os.path.splitext(item.path)[-1].decode('utf-8') # add extension
+                    beet_id = item.id
+                else:
+                    beet_id = -1
+                mount_path = cursor.mount_path + '/' + name
+                child = TreeNode(name, self.next_inode, beet_id, mount_path, cursor)
+                cursor = cursor.add_child(child)
+                if cursor.inode == self.next_inode: # if a new node was added to tree
+                    self.next_inode += 1
+        return root
 
-    def readdir(self, path, offset):
-        BEETFS_LOG.info("readdir on " + path)
-        path_split = path.split('/')[1:]
-        height = len(path_split)
-        root = fs_tree
-        if path == '/':
-            dirs = root
-        else:
-            for depth in range(0,height):
-                root = root.find('name', path_split[depth])
-            dirs = root
-        for d in  ('.', '..', *(x.name for x in dirs.children)):
-            yield fuse.Direntry(d)
+    async def getattr(self, inode, ctc=None):
+        print('getattr(self, {}, ctc={})'.format(inode, ctc))
+        entry = pyfuse3.EntryAttributes()
+        entry.st_ino = inode
+        item = self.tree.find('inode', inode)
+        if item.beet_id == -1: # dir
+            entry.st_mode = (stat.S_IFDIR | 0o755)
+            entry.st_nlink = 2
+            entry.st_size = 0
+        else: # file
+            entry.st_mode = (stat.S_IFREG | 0o644)
+            entry.st_nlink = 1
+            entry.st_size = 0
+        entry.st_uid = os.getuid()
+        entry.st_gid = os.getgid()
+        entry.st_rdev = 0 # is this necessary?
+        stamp = int(1438467123.985654 * 1e9) # random date
+        entry.st_atime_ns = stamp # TODO get from os
+        entry.st_ctime_ns = stamp # TODO get from os
+        entry.st_mtime_ns = stamp # TODO newer(beet db mtime, file mtime)
+        return entry
 
-    def open(self, path, flags):
-        BEETFS_LOG.info("open on " + path)
-        return 0
+    async def lookup(self, parent_inode, name, ctx=None):
+        print('lookup(self, {}, {}, {})'.format(parent_inode, name, ctx))
+        item = self.tree.find('inode', parent_inode)
+        for child in item.children:
+            if child.name == name:
+                return self.getattr(child.inode)
+        ret = pyfuse3.EntryAttributes()
+        ret.st_ino = 0
+        return ret
 
-    def read(self, path, size, offset):
-        BEETFS_LOG.info("read on " + path)
-        item_node = fs_tree.find('mount_path', path)
-        if not item_node:
-            return -errno.ENOENT
-        beet_item = library.get_item(item_node.beet_id)
-        with open(beet_item.path, 'rb') as ufile:
-            ufile.seek(offset)
-            return ufile.read(size)
+    async def opendir(self, inode, ctx): # TODO (?)
+        print('opendir(self, {}, {})'.format(inode, ctx))
+        return inode
+
+    async def readdir(self, inode, start_id, token):
+        print('readdir(self, {}, {}, {})'.format(inode, start_id, token))
+        if start_id == 0: # only need to read once to get DB values
+            item = self.tree.find('inode', inode)
+            for child in item.children:
+                print('returning {} of type {}'.format(child.name, type(child.name)))
+                entry = await self.getattr(child.inode)
+                pyfuse3.readdir_reply(token, bytes(child.name, encoding='utf-8'), entry, start_id + 1)
+        return
+
+    async def open(self, inode, flags, ctx): # TODO
+        print('open(self, {}, {}, {})'.format(inode, flags, ctx))
+        if inode != self.hello_inode:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        if flags & os.O_RDWR or flags & os.O_WRONLY:
+            raise pyfuse3.FUSEError(errno.EACCES)
+        return pyfuse3.FileInfo(fh=inode)
+
+    async def read(self, fh, off, size): # TODO
+        print('read(self, {}, {}, {})'.format(fh, off, size))
+        assert fh == self.hello_inode
+        return self.hello_data[off:off+size]

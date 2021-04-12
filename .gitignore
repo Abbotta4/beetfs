@@ -11,6 +11,7 @@ library.db
 state.pickle
 beetfs.log
 beets.log
+beetfs.log
 beetsplug/*
 !beetsplug/beetfs.py
-!beetsplug/_find_fuse_parts.py
+.env

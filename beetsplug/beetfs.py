@@ -51,7 +51,7 @@ class TreeNode():
 
     def add_child(self, child):
         for _child in self.children:
-            if _child.name == child.name: # match by name?
+            if _child.name == child.name: # assumes unique names
                 return _child
         self.children.append(child)
         return child
@@ -101,6 +101,7 @@ class Operations(pyfuse3.Operations):
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
         item = self.tree.find('inode', inode)
+        beet_item = library.get_item(item.beet_id)
         if item.beet_id == -1: # dir
             entry.st_mode = (stat.S_IFDIR | 0o755)
             entry.st_nlink = 2
@@ -108,7 +109,7 @@ class Operations(pyfuse3.Operations):
         else: # file
             entry.st_mode = (stat.S_IFREG | 0o644)
             entry.st_nlink = 1
-            entry.st_size = 0
+            entry.st_size = os.path.getsize(beet_item.path)
         entry.st_uid = os.getuid()
         entry.st_gid = os.getgid()
         entry.st_rdev = 0 # is this necessary?
@@ -128,7 +129,7 @@ class Operations(pyfuse3.Operations):
         ret.st_ino = 0
         return ret
 
-    async def opendir(self, inode, ctx): # TODO (?)
+    async def opendir(self, inode, ctx):
         print('opendir(self, {}, {})'.format(inode, ctx))
         return inode
 
@@ -142,15 +143,18 @@ class Operations(pyfuse3.Operations):
                 pyfuse3.readdir_reply(token, bytes(child.name, encoding='utf-8'), entry, start_id + 1)
         return
 
-    async def open(self, inode, flags, ctx): # TODO
+    async def open(self, inode, flags, ctx):
         print('open(self, {}, {}, {})'.format(inode, flags, ctx))
-        if inode != self.hello_inode:
-            raise pyfuse3.FUSEError(errno.ENOENT)
         if flags & os.O_RDWR or flags & os.O_WRONLY:
             raise pyfuse3.FUSEError(errno.EACCES)
         return pyfuse3.FileInfo(fh=inode)
 
-    async def read(self, fh, off, size): # TODO
+    async def read(self, fh, off, size): # passthrough
         print('read(self, {}, {}, {})'.format(fh, off, size))
-        assert fh == self.hello_inode
-        return self.hello_data[off:off+size]
+        item = self.tree.find('inode', fh) # fh = inode
+        beet_item = library.get_item(item.beet_id)
+        print('going to open {}'.format(beet_item.path))
+        with open(beet_item.path, 'rb') as bfile:
+            bfile.seek(off)
+            test = bfile.read(size)
+        return test

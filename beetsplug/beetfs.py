@@ -40,14 +40,72 @@ mount_command = subcommand('mount', help='mount a beets filesystem')
 mount_command.func = mount
 
 class TreeNode():
+    def find_data_start(self):
+        if self.beet_item == None: # dir
+            return False
+        with open(self.beet_item.path, 'rb') as bfile:
+            cursor = 4 # first 4 bytes are 'fLaC'
+            done = False
+            while not done:
+                bfile.seek(cursor)
+                block_header = int(bfile.read(1).hex(), 16)
+                length = int(bfile.read(3).hex(), 16)
+                cursor += 4 + length
+                done = block_header & 128 != 0
+            return cursor
+
+    def create_header(self):
+        if self.beet_item == None: # dir
+            return False
+        sections = {}
+        with open(self.beet_item.path, 'rb') as bfile:
+            cursor = 4 # first 4 bytes are 'fLaC'
+            done = False
+            while not done:
+                bfile.seek(cursor)
+                block_header_type = int(bfile.read(1).hex(), 16)
+                length = int(bfile.read(3).hex(), 16)
+                sections[block_header_type & 127] = bfile.read(length)
+                cursor += 4 + length
+                done = block_header_type & 128 != 0
+        vorbis_comment = b''
+        field_len = 0
+        for item in self.beet_item.items():
+            if item[1]:
+                field_len += 1
+                line = bytes(item[0].upper() + '=' + str(item[1]), 'utf-8')
+                line = len(line).to_bytes(4, 'little') + line
+                vorbis_comment += line
+        vorbis_comment = len(vorbis_comment).to_bytes(4, 'little') + vorbis_comment
+        vorbis_comment = b'\x05\x00\x00\x00beets' + vorbis_comment # 'beets' vendor string
+        sections[4] = vorbis_comment # VORBIS_COMMENT
+        header = b'fLaC' # beginning of flac header
+        for section in sorted(list(sections.keys())): # sort to get STREAMINFO first
+            if section == 1: # padding
+                continue
+            header += section.to_bytes(1, 'big') + len(sections[section]).to_bytes(3, 'big')
+            header += bytes(sections[section])
+        flac_padding = self.data_start - len(header) - 4
+        header += b'\x81' + flac_padding.to_bytes(3, 'big')
+        header += b'\x00' * flac_padding
+        return header
+
     def __init__(self, name='', inode=1, beet_id=-1, mount_path='', parent=None):
         BEETFS_LOG.info("Creating node " + str(name))
         self.name = name
         self.inode = inode
         self.beet_id = beet_id
+        _beet_item = library.get_item(self.beet_id)
+        self.beet_item = None if not _beet_item else _beet_item
         self.mount_path = mount_path
         self.parent = parent
         self.children = []
+        self.header = None
+        self.data_start = self.find_data_start() # where audio frame data starts in original file
+        _header = self.create_header()
+        self.header_len = False if not _header else len(_header)
+        if self.beet_item:
+            self.size = self.header_len + os.path.getsize(self.beet_item.path)
 
     def add_child(self, child):
         for _child in self.children:
@@ -101,15 +159,15 @@ class Operations(pyfuse3.Operations):
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
         item = self.tree.find('inode', inode)
-        beet_item = library.get_item(item.beet_id)
         if item.beet_id == -1: # dir
             entry.st_mode = (stat.S_IFDIR | 0o755)
             entry.st_nlink = 2
-            entry.st_size = 0
+            entry.st_size = 4096 # what should go here?
         else: # file
             entry.st_mode = (stat.S_IFREG | 0o644)
             entry.st_nlink = 1
-            entry.st_size = os.path.getsize(beet_item.path)
+            entry.st_size = item.size
+            entry.st_size = os.path.getsize(item.beet_item.path)
         entry.st_uid = os.getuid()
         entry.st_gid = os.getgid()
         entry.st_rdev = 0 # is this necessary?
@@ -147,14 +205,36 @@ class Operations(pyfuse3.Operations):
         print('open(self, {}, {}, {})'.format(inode, flags, ctx))
         if flags & os.O_RDWR or flags & os.O_WRONLY:
             raise pyfuse3.FUSEError(errno.EACCES)
+        item = self.tree.find('inode', inode)
+        item.header = item.create_header()
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, fh, off, size): # passthrough
         print('read(self, {}, {}, {})'.format(fh, off, size))
         item = self.tree.find('inode', fh) # fh = inode
-        beet_item = library.get_item(item.beet_id)
-        print('going to open {}'.format(beet_item.path))
-        with open(beet_item.path, 'rb') as bfile:
-            bfile.seek(off)
-            test = bfile.read(size)
-        return test
+        print('going to open {}'.format(item.beet_item.path))
+        data = b''
+        if off <= item.header_len:
+            data += item.header[off:off + size]
+            if off + size > item.header_len:
+                size = size - (item.header_len - off) # overlap into audio frames
+                off = item.header_len
+            else:
+                return data
+        with open(item.beet_item.path, 'rb') as bfile:
+            data_off = off - item.header_len + item.data_start
+            bfile.seek(data_off)
+            data += bfile.read(size)
+        return data
+
+    # this should be what's destroying the header, but release() seems
+    # to never be called. Instead destroy the header in flush() for now
+    async def release(self, fh):
+        print('read(self, {})'.format(fh))
+        item = self.tree.find('inode', fh) # fh = inode
+        item.header = None # to prevent holding headers in memory
+
+    async def flush(self, fh):
+        print('flush(self, {})'.format(fh))
+        item = self.tree.find('inode', fh) # fh = inode
+        item.header = None # to prevent holding headers in memory

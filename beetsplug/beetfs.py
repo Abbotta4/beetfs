@@ -1,4 +1,6 @@
 import os, stat, errno, datetime, pyfuse3, trio, logging
+from mutagen.easyid3 import EasyID3
+from io import BytesIO
 from beets import config
 from beets.plugins import BeetsPlugin as beetsplugin
 from beets.ui import Subcommand as subcommand
@@ -39,6 +41,69 @@ def mount(lib, opts, args):
 mount_command = subcommand('mount', help='mount a beets filesystem')
 mount_command.func = mount
 
+def get_id3_key(beet_key):
+    key_map = {
+        'album':                'album',
+        'bpm':                  'bpm',
+        #'':                    'compilation',
+        'composer':             'composer',
+        #'':                    'copyright',
+        'encoder':              'encodedby',
+        'lyricist':             'lyricist',
+        'length':               'length',
+        'media':                'media',
+        #'':                    'mood',
+        'title':                'title',
+        #'':                    'version',
+        'artist':               'artist',
+        'albumartist':          'albumartist',
+        #'':                    'conductor',
+        'arranger':             'arranger',
+        'disc':                 'discnumber',
+        #'':                    'organization',
+        'track':                'tracknumber',
+        #'':                    'author',
+        'albumartist_sort':     'albumartistsort',
+        #'':                    'albumsort',
+        'composer_sort':        'composersort',
+        'artist_sort':          'artistsort',
+        #'':                    'titlesort',
+        #'':                    'isrc',
+        #'':                    'discsubtitle',
+        'language':             'language',
+        'genre':                'genre',
+        #'':                    'date',
+        #'':                    'originaldate',
+        #'':                    'performer:*',
+        'mb_trackid':           'musicbrainz_trackid',
+        #'':                    'website',
+        'rg_track_gain':        'replaygain_*_gain',
+        'rg_track_peak':        'replaygain_*_peak',
+        'mb_artistid':          'musicbrainz_artistid',
+        'mb_albumid':           'musicbrainz_albumid',
+        'mb_albumartistid':     'musicbrainz_albumartistid',
+        #'':                    'musicbrainz_trmid',
+        #'':                    'musicip_puid',
+        #'':                    'musicip_fingerprint',
+        'albumstatus':          'musicbrainz_albumstatus',
+        'albumtype':            'musicbrainz_albumtype',
+        'country':              'releasecountry',
+        #'':                    'musicbrainz_discid',
+        'asin':                 'asin',
+        #'':                    'performer',
+        #'':                    'barcode',
+        'catalognum':           'catalognumber',
+        'mb_releasetrackid':    'musicbrainz_releasetrackid',
+        'mb_releasegroupid':    'musicbrainz_releasegroupid',
+        'mb_workid':            'musicbrainz_workid',
+        'acoustid_fingerprint': 'acoustid_fingerprint',
+        'acoustid_id':          'acoustid_id'
+    }
+    try:
+        return key_map[beet_key]
+    except KeyError:
+        return None
+
 class TreeNode():
     def find_data_start(self):
         if self.beet_item == None: # dir
@@ -54,7 +119,19 @@ class TreeNode():
                 done = block_header & 128 != 0
             return cursor
 
-    def create_header(self):
+    def create_mp3_header(self):
+        header = BytesIO()
+        id3 = EasyID3()
+        if self.beet_item == None: # dir
+            return False
+        for item in self.beet_item.items(): # beets tags
+            key = get_id3_key(item[0])
+            if item[1] and key:
+                id3[key] = item[1]
+        id3.save(fileobj=header, padding=(lambda x: 0))
+        return header.getvalue()
+
+    def create_flac_header(self):
         if self.beet_item == None: # dir
             return False
         sections = {}
@@ -102,7 +179,7 @@ class TreeNode():
         self.children = []
         self.header = None
         self.data_start = self.find_data_start() # where audio frame data starts in original file
-        _header = self.create_header()
+        _header = self.create_flac_header()
         self.header_len = False if not _header else len(_header)
         if self.beet_item:
             self.size = self.header_len + os.path.getsize(self.beet_item.path)
@@ -206,7 +283,7 @@ class Operations(pyfuse3.Operations):
         if flags & os.O_RDWR or flags & os.O_WRONLY:
             raise pyfuse3.FUSEError(errno.EACCES)
         item = self.tree.find('inode', inode)
-        item.header = item.create_header()
+        item.header = item.create_flac_header()
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, fh, off, size): # passthrough

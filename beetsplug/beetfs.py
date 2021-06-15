@@ -105,7 +105,24 @@ def get_id3_key(beet_key):
         return None
 
 class TreeNode():
-    def find_data_start(self):
+    def find_mp3_data_start(self):
+        if self.beet_item == None: # dir
+            return False
+        with open(self.beet_item.path, 'rb') as bfile:
+            beginning = bfile.read(3)
+            if beginning == b'ID3': # There is ID3 tag info
+                cursor = 6 # skip 'ID3', version, and flags
+                bfile.seek(cursor)
+                ssint = bfile.read(4)
+                size = ssint[3] | ssint[2] << 7 | ssint[1] << 14 | ssint[0] << 21
+                return size + 10
+            elif beginning[0] == 0xFF and beginning[1] & 0xE0 == 0xE0: # MPEG frame sync
+                # beginning & 0xFFE000 == 0xFFE000, tfw working with bits in python
+                return 0
+            else:
+                raise Exception('What is this? {}'.format(beginning))
+
+    def find_flac_data_start(self):
         if self.beet_item == None: # dir
             return False
         with open(self.beet_item.path, 'rb') as bfile:
@@ -127,7 +144,7 @@ class TreeNode():
         for item in self.beet_item.items(): # beets tags
             key = get_id3_key(item[0])
             if item[1] and key:
-                id3[key] = item[1]
+                id3[key] = str(item[1])
         id3.save(fileobj=header, padding=(lambda x: 0))
         return header.getvalue()
 
@@ -178,11 +195,12 @@ class TreeNode():
         self.parent = parent
         self.children = []
         self.header = None
-        self.data_start = self.find_data_start() # where audio frame data starts in original file
-        _header = self.create_flac_header()
+        self.data_start = self.find_mp3_data_start()
+#       self.data_start = self.find_flac_data_start() # where audio frame data starts in original file
+        _header = self.create_mp3_header()
         self.header_len = False if not _header else len(_header)
         if self.beet_item:
-            self.size = self.header_len + os.path.getsize(self.beet_item.path)
+            self.size = self.header_len + os.path.getsize(self.beet_item.path) - self.data_start
 
     def add_child(self, child):
         for _child in self.children:
@@ -244,7 +262,7 @@ class Operations(pyfuse3.Operations):
             entry.st_mode = (stat.S_IFREG | 0o644)
             entry.st_nlink = 1
             entry.st_size = item.size
-            entry.st_size = os.path.getsize(item.beet_item.path)
+            #entry.st_size = os.path.getsize(item.beet_item.path)
         entry.st_uid = os.getuid()
         entry.st_gid = os.getgid()
         entry.st_rdev = 0 # is this necessary?
@@ -283,7 +301,7 @@ class Operations(pyfuse3.Operations):
         if flags & os.O_RDWR or flags & os.O_WRONLY:
             raise pyfuse3.FUSEError(errno.EACCES)
         item = self.tree.find('inode', inode)
-        item.header = item.create_flac_header()
+        item.header = item.create_mp3_header()
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, fh, off, size): # passthrough

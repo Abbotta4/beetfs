@@ -7,7 +7,7 @@ from beets import config
 from beets.plugins import BeetsPlugin as beetsplugin
 from beets.ui import Subcommand as subcommand
 
-PATH_FORMAT = config['paths']['default'].get() # %first{$albumartist}/$album ($year)/$track $title
+PATH_FORMAT = config['paths']['default'].get()
 PATH_FORMAT_SPLIT = PATH_FORMAT.split('/')
 
 # TODO: see how other plugins do this
@@ -160,7 +160,7 @@ class TreeNode():
         id3.save(fileobj=header, padding=(lambda x: 0))
         return header.getvalue()
 
-    def create_flac_header(self):
+    def create_flac_header(self): # should we do this with mutagen?
         if self.beet_item == None: # dir
             return False
         sections = {}
@@ -269,19 +269,21 @@ class Operations(pyfuse3.Operations):
         if item.beet_id == -1: # dir
             entry.st_mode = (stat.S_IFDIR | 0o755)
             entry.st_nlink = 2
-            entry.st_size = 4096 # what should go here?
+            # these next entries should be more meaningful
+            entry.st_size = 4096
+            entry.st_atime_ns = 0
+            entry.st_ctime_ns = 0
+            entry.st_mtime_ns = 0
         else: # file
             entry.st_mode = (stat.S_IFREG | 0o644)
             entry.st_nlink = 1
             entry.st_size = item.size
-            #entry.st_size = os.path.getsize(item.beet_item.path)
+            entry.st_atime_ns = os.path.getatime(item.beet_item.path) * 1e9
+            entry.st_ctime_ns = os.path.getctime(item.beet_item.path) * 1e9
+            entry.st_mtime_ns = os.path.getmtime(item.beet_item.path) * 1e9
         entry.st_uid = os.getuid()
         entry.st_gid = os.getgid()
         entry.st_rdev = 0 # is this necessary?
-        stamp = int(1438467123.985654 * 1e9) # random date
-        entry.st_atime_ns = stamp # TODO get from os
-        entry.st_ctime_ns = stamp # TODO get from os
-        entry.st_mtime_ns = stamp # TODO newer(beet db mtime, file mtime)
         return entry
 
     async def lookup(self, parent_inode, name, ctx=None):
@@ -303,7 +305,6 @@ class Operations(pyfuse3.Operations):
         if start_id == 0: # only need to read once to get DB values
             item = self.tree.find('inode', inode)
             for child in item.children:
-                print('returning {} of type {}'.format(child.name, type(child.name)))
                 entry = await self.getattr(child.inode)
                 pyfuse3.readdir_reply(token, bytes(child.name, encoding='utf-8'), entry, start_id + 1)
         return
@@ -317,10 +318,9 @@ class Operations(pyfuse3.Operations):
         item.header = item.create_mp3_header() if item.item_type == 'mp3' else item.create_flac_header()
         return pyfuse3.FileInfo(fh=inode)
 
-    async def read(self, fh, off, size): # passthrough
+    async def read(self, fh, off, size):
         print('read(self, {}, {}, {})'.format(fh, off, size))
         item = self.tree.find('inode', fh) # fh = inode
-        print('going to open {}'.format(item.beet_item.path))
         data = b''
         if off <= item.header_len:
             data += item.header[off:off + size]
@@ -329,6 +329,7 @@ class Operations(pyfuse3.Operations):
                 off = item.header_len
             else:
                 return data
+        print('data from {}'.format(item.beet_item.path))
         with open(item.beet_item.path, 'rb') as bfile:
             data_off = off - item.header_len + item.data_start
             bfile.seek(data_off)

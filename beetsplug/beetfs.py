@@ -1,5 +1,7 @@
 import os, stat, errno, datetime, pyfuse3, trio, logging
 from mutagen.easyid3 import EasyID3
+from mutagen.flac import FLAC
+from mutagen.mp3 import MP3
 from io import BytesIO
 from beets import config
 from beets.plugins import BeetsPlugin as beetsplugin
@@ -105,6 +107,16 @@ def get_id3_key(beet_key):
         return None
 
 class TreeNode():
+    def guess_type(self):
+        if self.beet_item == None:
+            return False
+        path = self.beet_item.path
+        f = open(path, 'rb')
+        # TODO: don't read the entire file (multiple times!) here
+        mp3_score = MP3.score(path, f, f.read())
+        flac_score = FLAC.score(path, f, f.read())
+        return 'flac' if flac_score > mp3_score else 'mp3'
+
     def find_mp3_data_start(self):
         if self.beet_item == None: # dir
             return False
@@ -114,7 +126,7 @@ class TreeNode():
                 cursor = 6 # skip 'ID3', version, and flags
                 bfile.seek(cursor)
                 ssint = bfile.read(4)
-                size = ssint[3] | ssint[2] << 7 | ssint[1] << 14 | ssint[0] << 21
+                size = ssint[3] | ssint[2] << 7 | ssint[1] << 14 | ssint[0] << 21 # remove sync bits
                 return size + 10
             elif beginning[0] == 0xFF and beginning[1] & 0xE0 == 0xE0: # MPEG frame sync
                 # beginning & 0xFFE000 == 0xFFE000, tfw working with bits in python
@@ -195,9 +207,9 @@ class TreeNode():
         self.parent = parent
         self.children = []
         self.header = None
-        self.data_start = self.find_mp3_data_start()
-#       self.data_start = self.find_flac_data_start() # where audio frame data starts in original file
-        _header = self.create_mp3_header()
+        self.item_type = self.guess_type()
+        self.data_start = self.find_mp3_data_start() if self.item_type == 'mp3' else self.find_flac_data_start() # where audio frame data starts in original file
+        _header = self.create_mp3_header() if self.item_type == 'mp3' else self.create_flac_header()
         self.header_len = False if not _header else len(_header)
         if self.beet_item:
             self.size = self.header_len + os.path.getsize(self.beet_item.path) - self.data_start
@@ -301,7 +313,8 @@ class Operations(pyfuse3.Operations):
         if flags & os.O_RDWR or flags & os.O_WRONLY:
             raise pyfuse3.FUSEError(errno.EACCES)
         item = self.tree.find('inode', inode)
-        item.header = item.create_mp3_header()
+        print('open: item_type={}'.format(item.item_type))
+        item.header = item.create_mp3_header() if item.item_type == 'mp3' else item.create_flac_header()
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, fh, off, size): # passthrough
@@ -322,14 +335,10 @@ class Operations(pyfuse3.Operations):
             data += bfile.read(size)
         return data
 
-    # this should be what's destroying the header, but release() seems
-    # to never be called. Instead destroy the header in flush() for now
     async def release(self, fh):
-        print('read(self, {})'.format(fh))
+        print('release(self, {})'.format(fh))
         item = self.tree.find('inode', fh) # fh = inode
         item.header = None # to prevent holding headers in memory
 
     async def flush(self, fh):
         print('flush(self, {})'.format(fh))
-        item = self.tree.find('inode', fh) # fh = inode
-        item.header = None # to prevent holding headers in memory

@@ -13,6 +13,7 @@ else:
     PATH_FORMAT = config['paths']['default'].get().split('/')
 
 BEET_LOG = logging.getLogger('beets')
+FLAC_PADDING = 2048 # 2KB padding
 
 def mount(lib, opts, args):
     global library
@@ -180,9 +181,8 @@ class TreeNode():
                 continue
             header += section.to_bytes(1, 'big') + len(sections[section]).to_bytes(3, 'big')
             header += bytes(sections[section])
-        flac_padding = self.data_start - len(header) - 4
-        header += b'\x81' + flac_padding.to_bytes(3, 'big')
-        header += b'\x00' * flac_padding
+        header += b'\x81' + FLAC_PADDING.to_bytes(3, 'big')
+        header += b'\x00' * FLAC_PADDING
         return header
 
     def __init__(self, name='', inode=1, beet_id=-1, mount_path='', parent=None):

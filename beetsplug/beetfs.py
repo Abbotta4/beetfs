@@ -7,18 +7,8 @@ from beets import config
 from beets.plugins import BeetsPlugin as beetsplugin
 from beets.ui import Subcommand as subcommand
 
-if 'beetfs' in config:
-    PATH_FORMAT = config['beetfs']['path_format'].get().split('/')
-else:
-    PATH_FORMAT = config['paths']['default'].get().split('/')
-
-BEET_LOG = logging.getLogger('beets')
-FLAC_PADDING = 2048 # 2KB padding
-
 def mount(lib, opts, args):
-    global library
-    library = lib
-    beetfs = Operations()
+    beetfs = Operations(lib)
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add('fsname=beetfs')
     pyfuse3.init(beetfs, args[0], fuse_options)
@@ -29,9 +19,6 @@ def mount(lib, opts, args):
         raise
 
     pyfuse3.close()
-
-mount_command = subcommand('mount', help='mount a beets filesystem')
-mount_command.func = mount
 
 def get_id3_key(beet_key):
     key_map = {
@@ -181,12 +168,13 @@ class TreeNode():
                 continue
             header += section.to_bytes(1, 'big') + len(sections[section]).to_bytes(3, 'big')
             header += bytes(sections[section])
-        header += b'\x81' + FLAC_PADDING.to_bytes(3, 'big')
-        header += b'\x00' * FLAC_PADDING
+        flac_padding = 2048
+        header += b'\x81' + flac_padding.to_bytes(3, 'big')
+        header += b'\x00' * flac_padding
         return header
 
-    def __init__(self, name='', inode=1, beet_id=-1, mount_path='', parent=None):
-        BEET_LOG.debug("Creating node " + str(name))
+    def __init__(self, library, name='', inode=1, beet_id=-1, mount_path='', parent=None):
+        beetfs_logger.debug("Creating node " + str(name))
         self.name = name
         self.inode = inode
         self.beet_id = beet_id
@@ -211,7 +199,7 @@ class TreeNode():
         return child
 
     def find(self, attr, target): # DFS
-        BEET_LOG.debug("Searching for {} == {}".format(attr, target))
+        beetfs_logger.debug("Searching for {} == {}".format(attr, target))
         if getattr(self, attr) == target:
             return self
         for child in self.children:
@@ -220,38 +208,49 @@ class TreeNode():
                 return result
             
 class beetfs(beetsplugin):
+    mount_command = subcommand('mount', help='mount a beets filesystem')
+    mount_command.func = mount
     def commands(self):
-        return [mount_command]
+        return [self.mount_command]
+    def __init__(self):
+        super().__init__()
+        global beetfs_logger
+        beetfs_logger = self._log
 
 class Operations(pyfuse3.Operations):
     enable_writeback_cache = True
-    def __init__(self):
+    def __init__(self, library):
         super(Operations, self).__init__()
+        self.library = library
         self.next_inode = pyfuse3.ROOT_INODE + 1
         self.tree = self._build_fs_tree()
 
     def _build_fs_tree(self):
-        items = list(library.items())
-        root = TreeNode()
-        height = len(PATH_FORMAT)
+        items = list(self.library.items())
+        root = TreeNode(self.library)
+        if 'beetfs' in config:
+            path_format = config['beetfs']['path_format'].get().split('/')
+        else:
+            path_cormat = config['paths']['default'].get().split('/')
+        height = len(path_format)
         for item in items:
             cursor = root
             for depth in range(0, height):
-                name = item.evaluate_template(PATH_FORMAT[depth])
+                name = item.evaluate_template(path_format[depth])
                 if depth == height - 1: # file
                     name += os.path.splitext(item.path)[-1].decode('utf-8') # add extension
                     beet_id = item.id
                 else:
                     beet_id = -1
                 mount_path = cursor.mount_path + '/' + name
-                child = TreeNode(name, self.next_inode, beet_id, mount_path, cursor)
+                child = TreeNode(self.library, name, self.next_inode, beet_id, mount_path, cursor)
                 cursor = cursor.add_child(child)
                 if cursor.inode == self.next_inode: # if a new node was added to tree
                     self.next_inode += 1
         return root
 
     async def getattr(self, inode, ctc=None):
-        BEET_LOG.debug('getattr(self, {}, ctc={})'.format(inode, ctc))
+        beetfs_logger.debug('getattr(self, {}, ctc={})'.format(inode, ctc))
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
         item = self.tree.find('inode', inode)
@@ -276,7 +275,7 @@ class Operations(pyfuse3.Operations):
         return entry
 
     async def lookup(self, parent_inode, name, ctx=None):
-        BEET_LOG.debug('lookup(self, {}, {}, {})'.format(parent_inode, name, ctx))
+        beetfs_logger.debug('lookup(self, {}, {}, {})'.format(parent_inode, name, ctx))
         item = self.tree.find('inode', parent_inode)
         for child in item.children:
             if child.name == name:
@@ -286,11 +285,11 @@ class Operations(pyfuse3.Operations):
         return ret
 
     async def opendir(self, inode, ctx):
-        BEET_LOG.debug('opendir(self, {}, {})'.format(inode, ctx))
+        beetfs_logger.debug('opendir(self, {}, {})'.format(inode, ctx))
         return inode
 
     async def readdir(self, inode, start_id, token):
-        BEET_LOG.debug('readdir(self, {}, {}, {})'.format(inode, start_id, token))
+        beetfs_logger.debug('readdir(self, {}, {}, {})'.format(inode, start_id, token))
         if start_id == 0: # only need to read once to get DB values
             item = self.tree.find('inode', inode)
             for child in item.children:
@@ -299,16 +298,16 @@ class Operations(pyfuse3.Operations):
         return
 
     async def open(self, inode, flags, ctx):
-        BEET_LOG.debug('open(self, {}, {}, {})'.format(inode, flags, ctx))
+        beetfs_logger.debug('open(self, {}, {}, {})'.format(inode, flags, ctx))
         if flags & os.O_RDWR or flags & os.O_WRONLY:
             raise pyfuse3.FUSEError(errno.EACCES)
         item = self.tree.find('inode', inode)
-        BEET_LOG.debug('open: item_type={}'.format(item.item_type))
+        beetfs_logger.debug('open: item_type={}'.format(item.item_type))
         item.header = item.create_mp3_header() if item.item_type == 'mp3' else item.create_flac_header()
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, fh, off, size):
-        BEET_LOG.debug('read(self, {}, {}, {})'.format(fh, off, size))
+        beetfs_logger.debug('read(self, {}, {}, {})'.format(fh, off, size))
         item = self.tree.find('inode', fh) # fh = inode
         data = b''
         if off <= item.header_len:
@@ -318,7 +317,7 @@ class Operations(pyfuse3.Operations):
                 off = item.header_len
             else:
                 return data
-        BEET_LOG.debug('data from {}'.format(item.beet_item.path))
+        beetfs_logger.debug('data from {}'.format(item.beet_item.path))
         with open(item.beet_item.path, 'rb') as bfile:
             data_off = off - item.header_len + item.data_start
             bfile.seek(data_off)
@@ -326,9 +325,9 @@ class Operations(pyfuse3.Operations):
         return data
 
     async def release(self, fh):
-        BEET_LOG.debug('release(self, {})'.format(fh))
+        beetfs_logger.debug('release(self, {})'.format(fh))
         item = self.tree.find('inode', fh) # fh = inode
         item.header = None # to prevent holding headers in memory
 
     async def flush(self, fh):
-        BEET_LOG.debug('flush(self, {})'.format(fh))
+        beetfs_logger.debug('flush(self, {})'.format(fh))

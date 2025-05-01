@@ -15,3 +15,5 @@ beetfs.log
 beetsplug/*
 !beetsplug/beetfs.py
 .env
+Music/
+bmnt/

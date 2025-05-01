@@ -231,7 +231,7 @@ class Operations(pyfuse3.Operations):
         if 'beetfs' in config:
             path_format = config['beetfs']['path_format'].get().split('/')
         else:
-            path_cormat = config['paths']['default'].get().split('/')
+            path_format = config['paths']['default'].get().split('/')
         height = len(path_format)
         for item in items:
             cursor = root

@@ -1,23 +1,27 @@
-import os
-import stat
-import errno
-import datetime
-import pyfuse3
-import trio
-from mutagen.easyid3 import EasyID3
-from mutagen.flac import FLAC
-from mutagen.mp3 import MP3
-from io import BytesIO
 from beets import config
 from beets.dbcore import query as db_query
 from beets.plugins import BeetsPlugin as beetsplugin
 from beets.ui import Subcommand as subcommand
+from io import BytesIO
+from mutagen.easyid3 import EasyID3
+from mutagen.flac import FLAC
+from mutagen.mp3 import MP3
+import datetime
+import errno
+import logging
+import os
+import pyfuse3
+import stat
+import trio
 
-def mount(logger, lib, opts, args):
-    beetfs = Operations(logger, lib)
+beetfs_logger = logging.getLogger('beets')
+
+def mount(lib, opts, args):
+    beetfs_operations = Operations(lib)
+    replace_inode_table(lib, None)
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add('fsname=beetfs')
-    pyfuse3.init(beetfs, args[0], fuse_options)
+    pyfuse3.init(beetfs_operations, args[0], fuse_options)
     try:
         trio.run(pyfuse3.main)
     except:
@@ -88,36 +92,18 @@ def get_id3_key(beet_key):
         return key_map[beet_key]
     except KeyError:
         return None
-            
-class beetfs(beetsplugin):
-    mount_command = subcommand('mount', help='mount a beets filesystem')
-    def commands(self):
-        return [self.mount_command]
-    def __init__(self):
-        super().__init__()
-        self.mount_command.func = lambda lib, opts, args: mount(self._log, lib, opts, args)
-        # global beetfs_logger
-        # beetfs_logger = self._log
 
-class Operations(pyfuse3.Operations):
-    enable_writeback_cache = True
-    header_cache = {'modified': 0, 'header': None, 'beet_id': 0, 'header_len': 0}
-    def __init__(self, logger, library):
-        super(Operations, self).__init__()
-        self.beetfs_logger = logger
-        self.library = library
-        self.next_inode = pyfuse3.ROOT_INODE + 1
-        if 'beetfs' in config:
-            self.path_format = config['beetfs']['path_format'].get().split('/')
-        else:
-            self.path_format = config['paths']['default'].get().split('/')
-        self.replace_inode_table()
-    
-    def replace_inode_table(self):
-        self.beetfs_logger.info("Building inode tree...")
-        with self.library.transaction() as tx:
+def get_path_format():
+    if 'beetfs' in config:
+        return config['beetfs']['path_format'].get().split('/')
+    return config['paths']['default'].get().split('/')
+
+def replace_inode_table(lib, paths):
+        beetfs_logger.info("Building inode tree...")
+        path_format = get_path_format()
+        with lib.transaction() as tx:
             tx.mutate('DROP TABLE IF EXISTS inodes;')
-            comma_separated_columns = ', '.join(['"{}" TEXT'.format(x) for x in self.path_format])
+            comma_separated_columns = ', '.join(['"{}" TEXT'.format(x) for x in path_format])
             query = ('CREATE TABLE inodes ('
                         'inode INTEGER PRIMARY KEY, '
                         '{0}, '
@@ -125,26 +111,55 @@ class Operations(pyfuse3.Operations):
                         'FOREIGN KEY (item_id) REFERENCES items(id), '
                         'UNIQUE ({1})'
                     ');').format(comma_separated_columns, comma_separated_columns.replace(' TEXT', ''))
-            self.beetfs_logger.debug('{}', query)
+            beetfs_logger.debug('{}', query)
             tx.mutate(query)
-            comma_separated_columns = ', '.join(['"{}"'.format(x) for x in self.path_format])
-            comma_separated_blanks = ', '.join(['""']*len(self.path_format))
+            comma_separated_columns = ', '.join(['"{}"'.format(x) for x in path_format])
+            comma_separated_blanks = ', '.join(['""']*len(path_format))
             query = 'INSERT INTO inodes ({}) VALUES ({});'.format(comma_separated_columns, comma_separated_blanks)
-            self.beetfs_logger.debug('{}', query)
+            beetfs_logger.debug('{}', query)
             # insert a blank entry for the root inode "1"
             tx.mutate(query)
-            for item in self.library.items():
-                for i in [x+1 for x in range(len(self.path_format))]:
-                    comma_separated_columns = ', '.join(['"{}"'.format(x) for x in self.path_format]) + ', item_id'
-                    values = ['"{}"'.format(item.evaluate_template(x)) for x in self.path_format[:i]]
+            for item in lib.items():
+                for i in [x+1 for x in range(len(path_format))]:
+                    comma_separated_columns = ', '.join(['"{}"'.format(x) for x in path_format]) + ', item_id'
+                    values = ['"{}"'.format(item.evaluate_template(x)) for x in path_format[:i]]
                     # use "" instead of NULL to enable SQL UNIQUE
-                    values.extend([str(item.get('id'))] if len(values) == len(self.path_format) else ['""'])
-                    values.extend(['""']*(len(self.path_format)-len(values)+1))
+                    values.extend([str(item.get('id'))] if len(values) == len(path_format) else ['""'])
+                    values.extend(['""']*(len(path_format)-len(values)+1))
                     comma_separated_values = ', '.join(values)
                     query = 'INSERT OR IGNORE INTO inodes ({0}) VALUES ({1});'.format(comma_separated_columns, comma_separated_values)
-                    self.beetfs_logger.debug('{}', query)
+                    beetfs_logger.debug('{}', query)
                     tx.mutate(query)
-        self.beetfs_logger.info("Done.")
+        beetfs_logger.info("Done.")
+
+def remove_from_inode_table(item):
+    lib = item._db
+    with lib.transaction() as tx:
+        query = 'DELETE FROM inodes WHERE item_id = ?'
+        beetfs_logger.debug("{}", query)
+        beetfs_logger.info("Removing {} from beetfs", item.title)
+        tx.mutate(query, (item.id, ))
+
+class beetfs(beetsplugin):
+    mount_command = subcommand('mount', help='mount a beets filesystem')
+    def commands(self):
+        return [self.mount_command]
+
+    def __init__(self):
+        super().__init__()
+        self.mount_command.func = mount
+        # self.register_listener('database_change', replace_inode_table)
+        self.register_listener('import', replace_inode_table)
+        self.register_listener('item_removed', remove_from_inode_table)
+
+class Operations(pyfuse3.Operations):
+    enable_writeback_cache = True
+    header_cache = {'modified': 0, 'header': None, 'beet_id': 0, 'header_len': 0}
+    def __init__(self, library):
+        super(Operations, self).__init__()
+        self.library = library
+        self.next_inode = pyfuse3.ROOT_INODE + 1
+        self.path_format = get_path_format()
 
     def beet_item_from_inode(self, inode):
         with self.library.transaction() as tx:
@@ -225,7 +240,7 @@ class Operations(pyfuse3.Operations):
             return cursor
 
     async def getattr(self, inode, ctx=None):
-        self.beetfs_logger.info('getattr(self, {}, ctx={})'.format(inode, ctx))
+        beetfs_logger.info('getattr(self, {}, ctx={})'.format(inode, ctx))
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
         with self.library.transaction() as tx:
@@ -253,7 +268,7 @@ class Operations(pyfuse3.Operations):
         return entry
 
     async def lookup(self, parent_inode, name, ctx=None):
-        self.beetfs_logger.debug('lookup(self, {}, {}, {})'.format(parent_inode, name, ctx))
+        beetfs_logger.debug('lookup(self, {}, {}, {})'.format(parent_inode, name, ctx))
         entry = pyfuse3.EntryAttributes()
         entry.st_mode = (stat.S_IFDIR | 0o755)
         entry.st_nlink = 2
@@ -268,7 +283,7 @@ class Operations(pyfuse3.Operations):
         return entry
 
     async def opendir(self, inode, ctx):
-        self.beetfs_logger.debug('opendir(self, {}, {})'.format(inode, ctx))
+        beetfs_logger.debug('opendir(self, {}, {})'.format(inode, ctx))
         return inode
 
     # TODO() This does not yet do anything to preserve order or membership during a long readdir call
@@ -276,10 +291,10 @@ class Operations(pyfuse3.Operations):
     #        Potential fix would be some sort of mutex that allows for read-only access until all
     #        readdir_reply calls are finished
     async def readdir(self, inode, start_id, token):
-        self.beetfs_logger.debug('readdir(self, {}, {}, {})'.format(inode, start_id, token))
+        beetfs_logger.debug('readdir(self, {}, {}, {})'.format(inode, start_id, token))
         with self.library.transaction() as tx:
             query = 'SELECT {} FROM inodes WHERE inode = ?'.format(', '.join(['"{}"'.format(x) for x in self.path_format]))
-            self.beetfs_logger.debug('{}', query)
+            beetfs_logger.debug('{}', query)
             rows = tx.query(query, (inode, ))
         result = [x for x in rows[0] if x != '']
         depth = len(result)
@@ -291,7 +306,7 @@ class Operations(pyfuse3.Operations):
                 where_clause_list.append('"{}"=\'\''.format(col))
             where_clause = ' AND '.join(where_clause_list)
             query = 'SELECT inode, "{0}" FROM inodes WHERE {1} AND "{0}"!=\'\''.format(self.path_format[depth], where_clause)
-            self.beetfs_logger.debug('{}', query)
+            beetfs_logger.debug('{}', query)
             rows = tx.query(query)
         if start_id >= len(rows):
             return
@@ -301,15 +316,15 @@ class Operations(pyfuse3.Operations):
         return
 
     async def open(self, inode, flags, ctx):
-        self.beetfs_logger.debug('open(self, {}, {}, {})'.format(inode, flags, ctx))
+        beetfs_logger.debug('open(self, {}, {}, {})'.format(inode, flags, ctx))
         if flags & os.O_RDWR or flags & os.O_WRONLY:
             raise pyfuse3.FUSEError(errno.EACCES)
         item = self.beet_item_from_inode(inode)
         # TODO() handle other header types
         if self.header_cache['beet_id'] != item.get('id') or item.current_mtime() > self.header_cache['modified']:
-            self.beetfs_logger.debug("cache miss on:")
+            beetfs_logger.debug("cache miss on:")
             for k in self.header_cache:
-                self.beetfs_logger.debug("{} {}".format(k, self.header_cache[k]))
+                beetfs_logger.debug("{} {}".format(k, self.header_cache[k]))
             self.header_cache['header'] = self.create_mp3_header(item) if item.get('format') == 'MP3' else self.create_flac_header(item)
             self.header_cache['data_start'] = self.find_mp3_data_start(item) if item.get('format') == 'MP3' else self.find_flac_data_start(item)
             self.header_cache['header_len'] = len(self.header_cache['header'])
@@ -318,7 +333,7 @@ class Operations(pyfuse3.Operations):
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, fh, off, size):
-        self.beetfs_logger.debug('read(self, {}, {}, {})'.format(fh, off, size))
+        beetfs_logger.debug('read(self, {}, {}, {})'.format(fh, off, size))
         item = self.beet_item_from_inode(fh)
         data = b''
         if off <= self.header_cache['header_len']:
@@ -328,7 +343,7 @@ class Operations(pyfuse3.Operations):
                 off = self.header_cache['header_len']
             else:
                 return data
-        self.beetfs_logger.debug('data from {}'.format(item.path))
+        beetfs_logger.debug('data from {}'.format(item.path))
         with open(item.path, 'rb') as bfile:
             data_off = off - self.header_cache['header_len'] + self.header_cache['data_start']
             bfile.seek(data_off)
@@ -336,9 +351,9 @@ class Operations(pyfuse3.Operations):
         return data
 
     async def release(self, fh):
-        self.beetfs_logger.debug('release(self, {})'.format(fh))
+        beetfs_logger.debug('release(self, {})'.format(fh))
         item = self.beet_item_from_inode(fh) # fh is inode
         item.header = None # to prevent holding headers in memory
 
     async def flush(self, fh):
-        self.beetfs_logger.debug('flush(self, {})'.format(fh))
+        beetfs_logger.debug('flush(self, {})'.format(fh))

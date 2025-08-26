@@ -240,7 +240,7 @@ class Operations(pyfuse3.Operations):
             return cursor
 
     async def getattr(self, inode, ctx=None):
-        beetfs_logger.info('getattr(self, {}, ctx={})'.format(inode, ctx))
+        beetfs_logger.debug('getattr(self, {}, ctx={})'.format(inode, ctx))
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
         with self.library.transaction() as tx:
@@ -305,14 +305,19 @@ class Operations(pyfuse3.Operations):
             for col in self.path_format[depth+1:]:
                 where_clause_list.append('"{}"=\'\''.format(col))
             where_clause = ' AND '.join(where_clause_list)
-            query = 'SELECT inode, "{0}" FROM inodes WHERE {1} AND "{0}"!=\'\''.format(self.path_format[depth], where_clause)
+            query = 'SELECT inode, item_id, "{0}" FROM inodes WHERE {1} AND "{0}"!=\'\''.format(self.path_format[depth], where_clause)
             beetfs_logger.debug('{}', query)
             rows = tx.query(query)
         if start_id >= len(rows):
             return
         entry = await self.getattr(rows[start_id][0])
         # TODO() store the result here and manage lookup count
-        pyfuse3.readdir_reply(token, bytes(rows[start_id][1], encoding='utf-8'), entry, start_id + 1)
+        reply_name = rows[start_id][2]
+        if depth == len(self.path_format)-1:
+            item = self.library.get_item(rows[start_id][1])
+            # reply_name += os.path.splitext(item.path)[-1].decode('utf-8') # add extension
+            reply_name += ".{}".format(item.format.lower())
+        pyfuse3.readdir_reply(token, bytes(reply_name, encoding='utf-8'), entry, start_id + 1)
         return
 
     async def open(self, inode, flags, ctx):
@@ -343,7 +348,7 @@ class Operations(pyfuse3.Operations):
                 off = self.header_cache['header_len']
             else:
                 return data
-        beetfs_logger.debug('data from {}'.format(item.path))
+        beetfs_logger.debug(u'data from {0.path}', (item, ))
         with open(item.path, 'rb') as bfile:
             data_off = off - self.header_cache['header_len'] + self.header_cache['data_start']
             bfile.seek(data_off)
@@ -352,8 +357,7 @@ class Operations(pyfuse3.Operations):
 
     async def release(self, fh):
         beetfs_logger.debug('release(self, {})'.format(fh))
-        item = self.beet_item_from_inode(fh) # fh is inode
-        item.header = None # to prevent holding headers in memory
+        self.header_cache = {'modified': 0, 'header': None, 'beet_id': 0, 'header_len': 0}
 
     async def flush(self, fh):
         beetfs_logger.debug('flush(self, {})'.format(fh))

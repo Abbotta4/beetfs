@@ -108,6 +108,8 @@ def replace_inode_table(lib, paths):
                         'inode INTEGER PRIMARY KEY, '
                         '{0}, '
                         'item_id INTEGER, '
+                        'item_added REAL DEFAULT 0, '
+                        'FOREIGN KEY (item_added) REFERENCES items(added), '
                         'FOREIGN KEY (item_id) REFERENCES items(id), '
                         'UNIQUE ({1})'
                     ');').format(comma_separated_columns, comma_separated_columns.replace(' TEXT', ''))
@@ -121,13 +123,16 @@ def replace_inode_table(lib, paths):
             tx.mutate(query)
             for item in lib.items():
                 for i in [x+1 for x in range(len(path_format))]:
-                    comma_separated_columns = ', '.join(['"{}"'.format(x) for x in path_format]) + ', item_id'
+                    comma_separated_columns = ', '.join(['"{}"'.format(x) for x in path_format])
+                    comma_separated_columns += ', item_id, item_added'
                     values = ['"{}"'.format(item.evaluate_template(x)) for x in path_format[:i]]
                     # use "" instead of NULL to enable SQL UNIQUE
+                    values.extend(['""']*(len(path_format)-len(values)))
                     values.extend([str(item.get('id'))] if len(values) == len(path_format) else ['""'])
-                    values.extend(['""']*(len(path_format)-len(values)+1))
+                    values.extend([str(item.get('added'))])
                     comma_separated_values = ', '.join(values)
-                    query = 'INSERT OR IGNORE INTO inodes ({0}) VALUES ({1});'.format(comma_separated_columns, comma_separated_values)
+                    query = 'INSERT INTO inodes ({0}) VALUES ({1}) '.format(comma_separated_columns, comma_separated_values)
+                    query += 'ON CONFLICT ({0}) DO UPDATE SET item_added = MAX({1}, item_added)'.format(comma_separated_columns.replace(", item_id, item_added", ""), item.added)
                     beetfs_logger.debug('{}', query)
                     tx.mutate(query)
         beetfs_logger.info("Done.")
@@ -154,12 +159,14 @@ class beetfs(beetsplugin):
 
 class Operations(pyfuse3.Operations):
     enable_writeback_cache = True
-    header_cache = {'modified': 0, 'header': None, 'beet_id': 0, 'header_len': 0}
     def __init__(self, library):
         super(Operations, self).__init__()
         self.library = library
         self.next_inode = pyfuse3.ROOT_INODE + 1
         self.path_format = get_path_format()
+        self.header_cache = {'modified': 0, 'header': None, 'beet_id': 0, 'header_len': 0}
+        # TODO()
+        # self.cache_lock = trio.Lock()
 
     def beet_item_from_inode(self, inode):
         with self.library.transaction() as tx:
@@ -198,7 +205,7 @@ class Operations(pyfuse3.Operations):
                 line = bytes(beet_tag[0].upper() + '=' + str(beet_tag[1]), 'utf-8')
                 line = len(line).to_bytes(4, 'little') + line
                 vorbis_comment += line
-        vorbis_comment = len(vorbis_comment).to_bytes(4, 'little') + vorbis_comment
+        vorbis_comment = field_len.to_bytes(4, 'little') + vorbis_comment
         vorbis_comment = b'\x05\x00\x00\x00beets' + vorbis_comment # 'beets' vendor string
         sections[4] = vorbis_comment # VORBIS_COMMENT
         header = b'fLaC' # beginning of flac header
@@ -244,16 +251,19 @@ class Operations(pyfuse3.Operations):
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
         with self.library.transaction() as tx:
-            query = 'SELECT * FROM inodes WHERE inode = ?'
-            row = tx.query(query, (inode, ))
-        if len([x for x in row[0] if x != '']) < len(self.path_format)+2: # dir
+            comma_separated_columns = ', '.join(['"{}"'.format(x) for x in self.path_format])
+            comma_separated_columns += ', item_added'
+            query = 'SELECT {} FROM inodes WHERE inode = ?'.format(comma_separated_columns)
+            beetfs_logger.debug('{}', query)
+            rows = tx.query(query, (inode, ))
+        if len([x for x in rows[0][:-1] if x != '']) < len(self.path_format): # dir
             entry.st_mode = (stat.S_IFDIR | 0o755)
             entry.st_nlink = 2
             # these next entries should be more meaningful
             entry.st_size = 4096
             entry.st_atime_ns = 0
             entry.st_ctime_ns = 0
-            entry.st_mtime_ns = 0
+            entry.st_mtime_ns = int(float(rows[0][-1]) * 1e9)
         else: # file
             item = self.beet_item_from_inode(inode)
             entry.st_mode = (stat.S_IFREG | 0o644)
@@ -327,14 +337,18 @@ class Operations(pyfuse3.Operations):
         item = self.beet_item_from_inode(inode)
         # TODO() handle other header types
         if self.header_cache['beet_id'] != item.get('id') or item.current_mtime() > self.header_cache['modified']:
-            beetfs_logger.debug("cache miss on:")
-            for k in self.header_cache:
-                beetfs_logger.debug("{} {}".format(k, self.header_cache[k]))
             self.header_cache['header'] = self.create_mp3_header(item) if item.get('format') == 'MP3' else self.create_flac_header(item)
             self.header_cache['data_start'] = self.find_mp3_data_start(item) if item.get('format') == 'MP3' else self.find_flac_data_start(item)
             self.header_cache['header_len'] = len(self.header_cache['header'])
             self.header_cache['beet_id'] = item.get('id')
             self.header_cache['modified'] = item.current_mtime()
+            beetfs_logger.debug("cache miss, fetched:")
+            for k in self.header_cache:
+                if k == 'header':
+                    continue
+                beetfs_logger.debug("{} {}".format(k, self.header_cache[k]))
+        else:
+            beetfs_logger.debug("cache hit")
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, fh, off, size):
@@ -348,7 +362,7 @@ class Operations(pyfuse3.Operations):
                 off = self.header_cache['header_len']
             else:
                 return data
-        beetfs_logger.debug(u'data from {0.path}', (item, ))
+        beetfs_logger.debug(u'data from {0}', (item.path, ))
         with open(item.path, 'rb') as bfile:
             data_off = off - self.header_cache['header_len'] + self.header_cache['data_start']
             bfile.seek(data_off)
@@ -357,7 +371,8 @@ class Operations(pyfuse3.Operations):
 
     async def release(self, fh):
         beetfs_logger.debug('release(self, {})'.format(fh))
-        self.header_cache = {'modified': 0, 'header': None, 'beet_id': 0, 'header_len': 0}
+        # we use read() after release() for some reason, so don't actually drop the cache
+        # self.header_cache = {'modified': 0, 'header': None, 'beet_id': 0, 'header_len': 0}
 
     async def flush(self, fh):
         beetfs_logger.debug('flush(self, {})'.format(fh))

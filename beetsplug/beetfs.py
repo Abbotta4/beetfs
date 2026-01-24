@@ -99,43 +99,43 @@ def get_path_format():
     return config['paths']['default'].get().split('/')
 
 def replace_inode_table(lib, paths):
-        beetfs_logger.info("Building inode tree...")
-        path_format = get_path_format()
-        with lib.transaction() as tx:
-            tx.mutate('DROP TABLE IF EXISTS inodes;')
-            comma_separated_columns = ', '.join(['"{}" TEXT'.format(x) for x in path_format])
-            query = ('CREATE TABLE inodes ('
-                        'inode INTEGER PRIMARY KEY, '
-                        '{0}, '
-                        'item_id INTEGER, '
-                        'item_added REAL DEFAULT 0, '
-                        'FOREIGN KEY (item_added) REFERENCES items(added), '
-                        'FOREIGN KEY (item_id) REFERENCES items(id), '
-                        'UNIQUE ({1})'
-                    ');').format(comma_separated_columns, comma_separated_columns.replace(' TEXT', ''))
-            beetfs_logger.debug('{}', query)
-            tx.mutate(query)
-            comma_separated_columns = ', '.join(['"{}"'.format(x) for x in path_format])
-            comma_separated_blanks = ', '.join(['""']*len(path_format))
-            query = 'INSERT INTO inodes ({}) VALUES ({});'.format(comma_separated_columns, comma_separated_blanks)
-            beetfs_logger.debug('{}', query)
-            # insert a blank entry for the root inode "1"
-            tx.mutate(query)
-            for item in lib.items():
-                for i in [x+1 for x in range(len(path_format))]:
-                    comma_separated_columns = ', '.join(['"{}"'.format(x) for x in path_format])
-                    comma_separated_columns += ', item_id, item_added'
-                    values = ['"{}"'.format(item.evaluate_template(x)) for x in path_format[:i]]
-                    # use "" instead of NULL to enable SQL UNIQUE
-                    values.extend(['""']*(len(path_format)-len(values)))
-                    values.extend([str(item.get('id'))] if len(values) == len(path_format) else ['""'])
-                    values.extend([str(item.get('added'))])
-                    comma_separated_values = ', '.join(values)
-                    query = 'INSERT INTO inodes ({0}) VALUES ({1}) '.format(comma_separated_columns, comma_separated_values)
-                    query += 'ON CONFLICT ({0}) DO UPDATE SET item_added = MAX({1}, item_added)'.format(comma_separated_columns.replace(", item_id, item_added", ""), item.added)
-                    beetfs_logger.debug('{}', query)
-                    tx.mutate(query)
-        beetfs_logger.info("Done.")
+    beetfs_logger.info("Building inode tree...")
+    path_format = get_path_format()
+    with lib.transaction() as tx:
+        tx.mutate('DROP TABLE IF EXISTS inodes;')
+        comma_separated_columns = ', '.join(['"{}" TEXT'.format(x) for x in path_format])
+        query = ('CREATE TABLE inodes ('
+                    'inode INTEGER PRIMARY KEY, '
+                    '{0}, '
+                    'item_id INTEGER, '
+                    'item_added REAL DEFAULT 0, '
+                    'FOREIGN KEY (item_added) REFERENCES items(added), '
+                    'FOREIGN KEY (item_id) REFERENCES items(id), '
+                    'UNIQUE ({1})'
+                ');').format(comma_separated_columns, comma_separated_columns.replace(' TEXT', ''))
+        beetfs_logger.debug('{}', query)
+        tx.mutate(query)
+        comma_separated_columns = ', '.join(['"{}"'.format(x) for x in path_format])
+        comma_separated_blanks = ', '.join(['""']*len(path_format))
+        query = 'INSERT INTO inodes ({}) VALUES ({});'.format(comma_separated_columns, comma_separated_blanks)
+        beetfs_logger.debug('{}', query)
+        # insert a blank entry for the root inode "1"
+        tx.mutate(query)
+        for item in lib.items():
+            for i in [x+1 for x in range(len(path_format))]:
+                comma_separated_columns = ', '.join(['"{}"'.format(x) for x in path_format])
+                comma_separated_columns += ', item_id, item_added'
+                values = ['"{}"'.format(item.evaluate_template(x)) for x in path_format[:i]]
+                # use "" instead of NULL to enable SQL UNIQUE
+                values.extend(['""']*(len(path_format)-len(values)))
+                values.extend([str(item.get('id'))] if len(values) == len(path_format) else ['""'])
+                values.extend([str(item.get('added'))])
+                comma_separated_values = ', '.join(values)
+                query = 'INSERT INTO inodes ({0}) VALUES ({1}) '.format(comma_separated_columns, comma_separated_values)
+                query += 'ON CONFLICT ({0}) DO UPDATE SET item_added = MAX({1}, item_added)'.format(comma_separated_columns.replace(", item_id, item_added", ""), item.added)
+                beetfs_logger.debug('{}', query)
+                tx.mutate(query)
+    beetfs_logger.info("Done.")
 
 def remove_from_inode_table(item):
     lib = item._db

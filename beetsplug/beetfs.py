@@ -218,6 +218,16 @@ class Operations(pyfuse3.Operations):
         header += b'\x81' + flac_padding.to_bytes(3, 'big')
         header += b'\x00' * flac_padding
         return header
+
+    def create_header(self, item):
+        match item.format:
+            case "FLAC":
+                return create_flac_header(item)
+            case "MP3":
+                return create_mp3_header(item)
+            case _:
+                beetfs_logger.warning('File at {} is of unsupported filetype.'.format(item.path))
+                return None
     
     def find_mp3_data_start(self, item):
         with open(item.path, 'rb') as bfile:
@@ -245,6 +255,16 @@ class Operations(pyfuse3.Operations):
                 cursor += 4 + length
                 done = block_header & 128 != 0
             return cursor
+    
+    def find_data_start(self, item):
+        match item.format:
+            case "FLAC":
+                return find_flac_data_start(item)
+            case "MP3":
+                return find_mp3_data_start(item)
+            case _:
+                beetfs_logger.warning('File at {} is of unsupported filetype.'.format(item.path))
+                return None
 
     async def getattr(self, inode, ctx=None):
         beetfs_logger.debug('getattr(self, {}, ctx={})'.format(inode, ctx))
@@ -337,8 +357,8 @@ class Operations(pyfuse3.Operations):
         item = self.beet_item_from_inode(inode)
         # TODO() handle other header types
         if self.header_cache['beet_id'] != item.get('id') or item.current_mtime() > self.header_cache['modified']:
-            self.header_cache['header'] = self.create_mp3_header(item) if item.get('format') == 'MP3' else self.create_flac_header(item)
-            self.header_cache['data_start'] = self.find_mp3_data_start(item) if item.get('format') == 'MP3' else self.find_flac_data_start(item)
+            self.header_cache['header'] = self.create_header(item)
+            self.header_cache['data_start'] = self.find_data_start(item)
             self.header_cache['header_len'] = len(self.header_cache['header'])
             self.header_cache['beet_id'] = item.get('id')
             self.header_cache['modified'] = item.current_mtime()

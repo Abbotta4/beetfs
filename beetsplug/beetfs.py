@@ -23,13 +23,14 @@ def mount(lib, _opts, args):
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add('fsname=beetfs')
     pyfuse3.init(beetfs_operations, args[0], fuse_options)
-    try:
-        trio.run(pyfuse3.main)
-    except:
+    pid = os.fork()
+    if pid == 0:
+        try:
+            trio.run(pyfuse3.main)
+        except:
+            pyfuse3.close()
+            raise
         pyfuse3.close()
-        raise
-
-    pyfuse3.close()
 
 def get_id3_key(beet_key):
     """wrapper function for mapping beets id3 keys to the id3 key names"""

@@ -141,6 +141,9 @@ def replace_inode_table(lib, _paths):
                                 DO UPDATE SET item_added = MAX({item.added}, item_added)'''
                 beetfs_logger.debug('{}', query)
                 tx.mutate(query)
+        # update root inode
+        query = 'UPDATE inodes SET item_added = (SELECT MAX(item_added) FROM inodes WHERE inode != 1) WHERE inode = 1;'
+        tx.mutate(query)
     beetfs_logger.info("Done.")
 
 def remove_from_inode_table(item):

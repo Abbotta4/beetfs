@@ -108,7 +108,8 @@ def replace_inode_table(lib, _paths):
     path_format = get_path_format()
     with lib.transaction() as tx:
         tx.mutate('DROP TABLE IF EXISTS inodes;')
-        comma_separated_columns = ', '.join([f'"{x}" TEXT' for x in path_format])
+        # minimal column name sanitization
+        comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}" TEXT' for x in path_format])
         query = f'''CREATE TABLE inodes (
                         inode INTEGER PRIMARY KEY,
                         {comma_separated_columns},
@@ -120,27 +121,29 @@ def replace_inode_table(lib, _paths):
                 );'''
         beetfs_logger.debug('{}', query)
         tx.mutate(query)
-        comma_separated_columns = ', '.join([f'"{x}"' for x in path_format])
-        comma_separated_blanks = ', '.join(['""']*len(path_format))
-        query = f'INSERT INTO inodes ({comma_separated_columns}) VALUES ({comma_separated_blanks});'
-        beetfs_logger.debug('{}', query)
+        comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}"' for x in path_format])
+        comma_separated_blanks = ', '.join(['']*len(path_format))
+        comma_separated_interos = ', '.join(['?']*len(path_format))
+        query = f'INSERT INTO inodes ({comma_separated_columns}) VALUES ({comma_separated_interos});'
+        beetfs_logger.debug('{} {}', query, tuple(comma_separated_blanks))
         # insert a blank entry for the root inode "1"
-        tx.mutate(query)
+        tx.mutate(query, tuple([""]*len(path_format)))
         for item in lib.items():
             for i in [x+1 for x in range(len(path_format))]:
-                comma_separated_columns = ', '.join([f'"{x}"' for x in path_format])
+                comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}"' for x in path_format])
                 comma_separated_columns += ', item_id, item_added'
-                values = [f'"{item.evaluate_template(x)}"' for x in path_format[:i]]
-                # use "" instead of NULL to enable SQL UNIQUE
-                values.extend(['""']*(len(path_format)-len(values)))
-                values.extend([str(item.get('id'))] if len(values) == len(path_format) else ['""'])
+                # replace / with _ for unix path sanity
+                values = [f'{item.evaluate_template(x).replace('/', '_')}' for x in path_format[:i]]
+                # use '' instead of NULL to enable SQL UNIQUE
+                values.extend(['']*(len(path_format)-len(values)))
+                values.extend([str(item.get('id'))] if len(values) == len(path_format) else [''])
                 values.extend([str(item.get('added'))])
-                comma_separated_values = ', '.join(values)
-                query = f'INSERT INTO inodes ({comma_separated_columns}) VALUES ({comma_separated_values}) '
+                comma_separated_interos = ', '.join(['?']*len(values))
+                query = f'INSERT INTO inodes ({comma_separated_columns}) VALUES ({comma_separated_interos}) '
                 query += f'''ON CONFLICT ({comma_separated_columns.replace(", item_id, item_added", "")})
                                 DO UPDATE SET item_added = MAX({item.added}, item_added)'''
-                beetfs_logger.debug('{}', query)
-                tx.mutate(query)
+                beetfs_logger.debug('{} {}', query, tuple(values))
+                tx.mutate(query, tuple(values))
         # update root inode
         query = 'UPDATE inodes SET item_added = (SELECT MAX(item_added) FROM inodes WHERE inode != 1) WHERE inode = 1;'
         tx.mutate(query)
@@ -295,7 +298,7 @@ class Operations(pyfuse3.Operations):
             comma_separated_columns = ', '.join([f'"{x}"' for x in self.path_format])
             comma_separated_columns += ', item_added'
             query = f'SELECT {comma_separated_columns} FROM inodes WHERE inode = ?'
-            beetfs_logger.debug('{}', query)
+            beetfs_logger.debug('{} {}', query, inode)
             rows = tx.query(query, (inode, ))
         if len([x for x in rows[0][:-1] if x != '']) < len(self.path_format): # dir
             entry.st_mode = stat.S_IFDIR | 0o755
@@ -349,21 +352,21 @@ class Operations(pyfuse3.Operations):
         with self.library.transaction() as tx:
             comma_separated_columns = ', '.join([f'"{x}"' for x in self.path_format])
             query = f'SELECT {comma_separated_columns} FROM inodes WHERE inode = ?'
-            beetfs_logger.debug('{}', query)
+            beetfs_logger.debug('{} {}', query, fh)
             rows = tx.query(query, (fh, ))
         result = [x for x in rows[0] if x != '']
         depth = len(result)
         with self.library.transaction() as tx:
             where_clause_list = []
             for col, col_name in zip(result, self.path_format):
-                where_clause_list.append(f'"{col_name}"=\'{col}\'')
+                where_clause_list.extend([col_name, col])
             for col in self.path_format[depth+1:]:
-                where_clause_list.append(f'"{col}"=\'\'')
-            where_clause = ' AND '.join(where_clause_list)
+                where_clause_list.extend([col, ''])
+            where_clause = ' AND '.join([f'"{x.replace('"', '""')}" = ?' for x in where_clause_list[0::2]])
             col = self.path_format[depth]
-            query = f'SELECT inode, item_id, "{col}" FROM inodes WHERE {where_clause} AND "{col}"!=\'\''
-            beetfs_logger.debug('{}', query)
-            rows = tx.query(query)
+            query = f'SELECT inode, item_id, "{col}" FROM inodes WHERE {where_clause} AND "{col}" != ?'
+            beetfs_logger.debug('{} {}', query, where_clause_list[1::2] + [''])
+            rows = tx.query(query, tuple(where_clause_list[1::2] + ['']))
         if start_id >= len(rows):
             return
         entry = await self.getattr(rows[start_id][0])
@@ -374,7 +377,6 @@ class Operations(pyfuse3.Operations):
             # reply_name += os.path.splitext(item.path)[-1].decode('utf-8') # add extension
             reply_name += f'.{item.format.lower()}'
         pyfuse3.readdir_reply(token, bytes(reply_name, encoding='utf-8'), entry, start_id + 1)
-        return
 
     async def open(self, inode, flags, ctx):
         """FUSE API implementation for 'open file'"""

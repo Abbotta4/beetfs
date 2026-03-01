@@ -102,7 +102,7 @@ def get_path_format():
         return config['beetfs']['path_format'].get().split('/')
     return config['paths']['default'].get().split('/')
 
-def replace_inode_table(lib, _paths):
+def replace_inode_table(lib, paths): # pylint: disable=unused-argument
     """creates the inodes table from scratch (every time)"""
     beetfs_logger.info("Building inode tree...")
     path_format = get_path_format()

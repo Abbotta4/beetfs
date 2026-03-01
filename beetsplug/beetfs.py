@@ -18,6 +18,9 @@ beetfs_logger = logging.getLogger('beets')
 
 def mount(lib, _opts, args):
     """beetfs function for mounting the pyfuse3 filesystem"""
+    if len(args) != 1:
+        beetfs_logger.error("error: beet mount takes exactly 1 positional argument")
+        return
     beetfs_operations = Operations(lib)
     replace_inode_table(lib, None)
     fuse_options = set(pyfuse3.default_options)
@@ -162,6 +165,7 @@ def remove_from_inode_table(item):
 class Beetfs(beetsplugin):
     """plugin class for adding beetfs functionality to beets"""
     mount_command = subcommand('mount', help='mount a beets filesystem')
+    mount_command.parser.set_usage('beet mount MOUNTPOINT [options]')
     def commands(self):
         return [self.mount_command]
 

@@ -5,6 +5,7 @@ import errno
 import logging
 import os
 import stat
+import confuse
 import trio
 
 import pyfuse3
@@ -16,177 +17,194 @@ from beets.ui import Subcommand as subcommand
 
 beetfs_logger = logging.getLogger('beets')
 
-def mount(lib, _opts, args):
-    """beetfs function for mounting the pyfuse3 filesystem"""
-    if len(args) != 1:
-        beetfs_logger.error("error: beet mount takes exactly 1 positional argument")
-        return
-    beetfs_operations = Operations(lib)
-    replace_inode_table(lib, None)
-    fuse_options = set(pyfuse3.default_options)
-    fuse_options.add('fsname=beetfs')
-    pyfuse3.init(beetfs_operations, args[0], fuse_options)
-    pid = os.fork()
-    if pid == 0:
-        try:
-            trio.run(pyfuse3.main)
-        except:
-            pyfuse3.close()
-            raise
-        pyfuse3.close()
-
-def get_id3_key(beet_key):
-    """wrapper function for mapping beets id3 keys to the id3 key names"""
-    key_map = {
-        'album':                'album',
-        'bpm':                  'bpm',
-        #'':                    'compilation',
-        'composer':             'composer',
-        #'':                    'copyright',
-        'encoder':              'encodedby',
-        'lyricist':             'lyricist',
-        'length':               'length',
-        'media':                'media',
-        #'':                    'mood',
-        'title':                'title',
-        #'':                    'version',
-        'artist':               'artist',
-        'albumartist':          'albumartist',
-        #'':                    'conductor',
-        'arranger':             'arranger',
-        'disc':                 'discnumber',
-        #'':                    'organization',
-        'track':                'tracknumber',
-        #'':                    'author',
-        'albumartist_sort':     'albumartistsort',
-        #'':                    'albumsort',
-        'composer_sort':        'composersort',
-        'artist_sort':          'artistsort',
-        #'':                    'titlesort',
-        #'':                    'isrc',
-        #'':                    'discsubtitle',
-        'language':             'language',
-        'genre':                'genre',
-        #'':                    'date',
-        #'':                    'originaldate',
-        #'':                    'performer:*',
-        'mb_trackid':           'musicbrainz_trackid',
-        #'':                    'website',
-        'rg_track_gain':        'replaygain_*_gain',
-        'rg_track_peak':        'replaygain_*_peak',
-        'mb_artistid':          'musicbrainz_artistid',
-        'mb_albumid':           'musicbrainz_albumid',
-        'mb_albumartistid':     'musicbrainz_albumartistid',
-        #'':                    'musicbrainz_trmid',
-        #'':                    'musicip_puid',
-        #'':                    'musicip_fingerprint',
-        'albumstatus':          'musicbrainz_albumstatus',
-        'albumtype':            'musicbrainz_albumtype',
-        'country':              'releasecountry',
-        #'':                    'musicbrainz_discid',
-        'asin':                 'asin',
-        #'':                    'performer',
-        #'':                    'barcode',
-        'catalognum':           'catalognumber',
-        'mb_releasetrackid':    'musicbrainz_releasetrackid',
-        'mb_releasegroupid':    'musicbrainz_releasegroupid',
-        'mb_workid':            'musicbrainz_workid',
-        'acoustid_fingerprint': 'acoustid_fingerprint',
-        'acoustid_id':          'acoustid_id'
-    }
-    try:
-        return key_map[beet_key]
-    except KeyError:
-        return None
-
 def get_path_format():
     """fetches the path format from config else gives default value"""
     if 'beetfs' in config:
         return config['beetfs']['path_format'].get().split('/')
     return config['paths']['default'].get().split('/')
 
-def replace_inode_table(lib, paths): # pylint: disable=unused-argument
-    """creates the inodes table from scratch (every time)"""
-    beetfs_logger.info("Building inode tree...")
-    path_format = get_path_format()
-    with lib.transaction() as tx:
-        tx.mutate('DROP TABLE IF EXISTS inodes;')
-        # minimal column name sanitization
-        comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}" TEXT' for x in path_format])
-        query = f'''CREATE TABLE inodes (
-                        inode INTEGER PRIMARY KEY,
-                        {comma_separated_columns},
-                        item_id INTEGER,
-                        item_added REAL DEFAULT 0,
-                        FOREIGN KEY (item_added) REFERENCES items(added),
-                        FOREIGN KEY (item_id) REFERENCES items(id),
-                        UNIQUE ({comma_separated_columns.replace(' TEXT', '')})
-                );'''
-        beetfs_logger.debug('{}', query)
-        tx.mutate(query)
-        comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}"' for x in path_format])
-        comma_separated_blanks = ', '.join(['']*len(path_format))
-        comma_separated_interos = ', '.join(['?']*len(path_format))
-        query = f'INSERT INTO inodes ({comma_separated_columns}) VALUES ({comma_separated_interos});'
-        beetfs_logger.debug('{} {}', query, tuple(comma_separated_blanks))
-        # insert a blank entry for the root inode "1"
-        tx.mutate(query, tuple([""]*len(path_format)))
-        for item in lib.items():
-            for i in [x+1 for x in range(len(path_format))]:
-                comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}"' for x in path_format])
-                comma_separated_columns += ', item_id, item_added'
-                # replace / with _ for unix path sanity
-                values = [f'{item.evaluate_template(x).replace('/', '_')}' for x in path_format[:i]]
-                # use '' instead of NULL to enable SQL UNIQUE
-                values.extend(['']*(len(path_format)-len(values)))
-                values.extend([str(item.get('id'))] if len(values) == len(path_format) else [''])
-                values.extend([str(item.get('added'))])
-                comma_separated_interos = ', '.join(['?']*len(values))
-                query = f'INSERT INTO inodes ({comma_separated_columns}) VALUES ({comma_separated_interos}) '
-                query += f'''ON CONFLICT ({comma_separated_columns.replace(", item_id, item_added", "")})
-                                DO UPDATE SET item_added = MAX({item.added}, item_added)'''
-                beetfs_logger.debug('{} {}', query, tuple(values))
-                tx.mutate(query, tuple(values))
-        # update root inode
-        query = 'UPDATE inodes SET item_added = (SELECT MAX(item_added) FROM inodes WHERE inode != 1) WHERE inode = 1;'
-        tx.mutate(query)
-    beetfs_logger.info("Done.")
-
-def remove_from_inode_table(item):
-    """removes an item from the inode table"""
-    # Access the lib through private member until there is a better way to get it
-    lib = item._db # pylint: disable=protected-access
-    with lib.transaction() as tx:
-        query = 'DELETE FROM inodes WHERE item_id = ?'
-        beetfs_logger.debug("{}", query)
-        beetfs_logger.info("Removing {} from beetfs", item.title)
-        tx.mutate(query, (item.id, ))
-
 class Beetfs(beetsplugin):
     """plugin class for adding beetfs functionality to beets"""
-    mount_command = subcommand('mount', help='mount a beets filesystem')
-    mount_command.parser.set_usage('beet mount MOUNTPOINT [options]')
     def commands(self):
         return [self.mount_command]
 
     def __init__(self):
         super().__init__()
-        self.mount_command.func = mount
+        self.mount_command = subcommand('mount', help='mount a beets filesystem')
+        self.mount_command.parser.set_usage('beet mount MOUNTPOINT [options]')
+        self.mount_command.parser.add_option(
+            '-q',
+            '--query',
+            action='store',
+            type='string',
+            dest='query',
+            help='query for filtering mounted items'
+        )
+        self.mount_command.func = self.mount
+        self.mount_query = None
         # self.register_listener('database_change', replace_inode_table)
-        self.register_listener('import', replace_inode_table)
-        self.register_listener('item_removed', remove_from_inode_table)
+        self.register_listener('import', lambda lib, paths: self.replace_inode_table(lib, self.mount_query))
+        self.register_listener('item_removed', self.remove_from_inode_table)
+
+    def mount(self, lib, opts, args):
+        """beetfs function for mounting the pyfuse3 filesystem"""
+        if len(args) != 1:
+            beetfs_logger.error("error: beet mount takes exactly 1 positional argument")
+            return
+        beetfs_operations = Operations(lib)
+        try:
+            self.mount_query = config['beetfs']['filter_query'].get()
+        except confuse.ConfigError:
+            self.mount_query = None
+        if opts.query:
+            self.mount_query = opts.query
+        self.replace_inode_table(lib, self.mount_query)
+        fuse_options = set(pyfuse3.default_options)
+        fuse_options.add('fsname=beetfs')
+        pyfuse3.init(beetfs_operations, args[0], fuse_options)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                trio.run(pyfuse3.main)
+            except:
+                pyfuse3.close()
+                raise
+            pyfuse3.close()
+
+    def replace_inode_table(self, lib, mount_query): # pylint: disable=unused-argument
+        """creates the inodes table from scratch (every time)"""
+        beetfs_logger.info("Building inode tree...")
+        path_format = get_path_format()
+        with lib.transaction() as tx:
+            tx.mutate('DROP TABLE IF EXISTS inodes;')
+            # minimal column name sanitization
+            comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}" TEXT' for x in path_format])
+            query = f'''CREATE TABLE inodes (
+                            inode INTEGER PRIMARY KEY,
+                            {comma_separated_columns},
+                            item_id INTEGER,
+                            item_added REAL DEFAULT 0,
+                            FOREIGN KEY (item_added) REFERENCES items(added),
+                            FOREIGN KEY (item_id) REFERENCES items(id),
+                            UNIQUE ({comma_separated_columns.replace(' TEXT', '')})
+                    );'''
+            beetfs_logger.debug('{}', query)
+            tx.mutate(query)
+            comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}"' for x in path_format])
+            comma_separated_blanks = ', '.join(['']*len(path_format))
+            comma_separated_interos = ', '.join(['?']*len(path_format))
+            query = f'INSERT INTO inodes ({comma_separated_columns}) VALUES ({comma_separated_interos});'
+            beetfs_logger.debug('{} {}', query, tuple(comma_separated_blanks))
+            # insert a blank entry for the root inode "1"
+            tx.mutate(query, tuple([""]*len(path_format)))
+            for item in lib.items(query=mount_query):
+                for i in [x+1 for x in range(len(path_format))]:
+                    comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}"' for x in path_format])
+                    comma_separated_columns += ', item_id, item_added'
+                    # replace / with _ for unix path sanity
+                    values = [f'{item.evaluate_template(x).replace('/', '_')}' for x in path_format[:i]]
+                    # use '' instead of NULL to enable SQL UNIQUE
+                    values.extend(['']*(len(path_format)-len(values)))
+                    values.extend([str(item.get('id'))] if len(values) == len(path_format) else [''])
+                    values.extend([str(item.get('added'))])
+                    comma_separated_interos = ', '.join(['?']*len(values))
+                    query = f'INSERT INTO inodes ({comma_separated_columns}) VALUES ({comma_separated_interos}) '
+                    query += f'''ON CONFLICT ({comma_separated_columns.replace(", item_id, item_added", "")})
+                                    DO UPDATE SET item_added = MAX({item.added}, item_added)'''
+                    beetfs_logger.debug('{} {}', query, tuple(values))
+                    tx.mutate(query, tuple(values))
+            # update root inode
+            query = '''UPDATE inodes SET item_added = (SELECT MAX(item_added)
+                        FROM inodes WHERE inode != 1) WHERE inode = 1;'''
+            tx.mutate(query)
+        beetfs_logger.info("Done.")
+
+    def remove_from_inode_table(self, item):
+        """removes an item from the inode table"""
+        # Access the lib through private member until there is a better way to get it
+        lib = item._db # pylint: disable=protected-access
+        with lib.transaction() as tx:
+            query = 'DELETE FROM inodes WHERE item_id = ?'
+            beetfs_logger.debug("{}", query)
+            beetfs_logger.info("Removing {} from beetfs", item.title)
+            tx.mutate(query, (item.id, ))
 
 class Operations(pyfuse3.Operations):
     """class providing FUSE operations read, write, open, etc."""
     enable_writeback_cache = True
     def __init__(self, library):
-        super(Operations, self).__init__()
+        super().__init__()
+        # super(Operations, self).__init__()
         self.library = library
         self.next_inode = pyfuse3.ROOT_INODE + 1
         self.path_format = get_path_format()
         self.header_cache = {'modified': 0, 'header': '', 'beet_id': 0, 'header_len': 0}
         # TODO()
         # self.cache_lock = trio.Lock()
+
+    def get_id3_key(self, beet_key):
+        """wrapper function for mapping beets id3 keys to the id3 key names"""
+        key_map = {
+            'album':                'album',
+            'bpm':                  'bpm',
+            #'':                    'compilation',
+            'composer':             'composer',
+            #'':                    'copyright',
+            'encoder':              'encodedby',
+            'lyricist':             'lyricist',
+            'length':               'length',
+            'media':                'media',
+            #'':                    'mood',
+            'title':                'title',
+            #'':                    'version',
+            'artist':               'artist',
+            'albumartist':          'albumartist',
+            #'':                    'conductor',
+            'arranger':             'arranger',
+            'disc':                 'discnumber',
+            #'':                    'organization',
+            'track':                'tracknumber',
+            #'':                    'author',
+            'albumartist_sort':     'albumartistsort',
+            #'':                    'albumsort',
+            'composer_sort':        'composersort',
+            'artist_sort':          'artistsort',
+            #'':                    'titlesort',
+            #'':                    'isrc',
+            #'':                    'discsubtitle',
+            'language':             'language',
+            'genre':                'genre',
+            #'':                    'date',
+            #'':                    'originaldate',
+            #'':                    'performer:*',
+            'mb_trackid':           'musicbrainz_trackid',
+            #'':                    'website',
+            'rg_track_gain':        'replaygain_*_gain',
+            'rg_track_peak':        'replaygain_*_peak',
+            'mb_artistid':          'musicbrainz_artistid',
+            'mb_albumid':           'musicbrainz_albumid',
+            'mb_albumartistid':     'musicbrainz_albumartistid',
+            #'':                    'musicbrainz_trmid',
+            #'':                    'musicip_puid',
+            #'':                    'musicip_fingerprint',
+            'albumstatus':          'musicbrainz_albumstatus',
+            'albumtype':            'musicbrainz_albumtype',
+            'country':              'releasecountry',
+            #'':                    'musicbrainz_discid',
+            'asin':                 'asin',
+            #'':                    'performer',
+            #'':                    'barcode',
+            'catalognum':           'catalognumber',
+            'mb_releasetrackid':    'musicbrainz_releasetrackid',
+            'mb_releasegroupid':    'musicbrainz_releasegroupid',
+            'mb_workid':            'musicbrainz_workid',
+            'acoustid_fingerprint': 'acoustid_fingerprint',
+            'acoustid_id':          'acoustid_id'
+        }
+        try:
+            return key_map[beet_key]
+        except KeyError:
+            return None
 
     def beet_item_from_inode(self, inode):
         """fetches beets Item with inode"""
@@ -201,7 +219,7 @@ class Operations(pyfuse3.Operations):
         header = BytesIO()
         id3 = EasyID3()
         for beet_tag in item.items(): # beets tags
-            key = get_id3_key(beet_tag[0])
+            key = self.get_id3_key(beet_tag[0])
             if beet_tag[1] and key:
                 id3[key] = str(beet_tag[1])
         id3.save(filething=header, padding=lambda x: 0)

@@ -116,7 +116,7 @@ class Operations(pyfuse3.Operations):
     """class providing FUSE operations read, write, open, etc."""
     enable_writeback_cache = True
     def __init__(self, library):
-        super(Operations, self).__init__()
+        super().__init__()
         self.library = library
         self.next_inode = pyfuse3.ROOT_INODE + 1
         self.path_format = get_path_format()
@@ -198,11 +198,10 @@ class Operations(pyfuse3.Operations):
                 ssint = bfile.read(4)
                 size = ssint[3] | ssint[2] << 7 | ssint[1] << 14 | ssint[0] << 21 # remove sync bits
                 return size + 10
-            elif beginning[0] == 0xFF and beginning[1] & 0xE0 == 0xE0: # MPEG frame sync
+            if beginning[0] == 0xFF and beginning[1] & 0xE0 == 0xE0: # MPEG frame sync
                 # beginning & 0xFFE000 == 0xFFE000, tfw working with bits in python
                 return 0
-            else:
-                raise RuntimeError(f"What is this? {beginning}")
+            raise RuntimeError(f"What is this? {beginning}")
 
     def find_flac_data_start(self, item):
         """finds the offset in a source flac where the audio frames begin"""

@@ -9,11 +9,12 @@ import confuse
 import trio
 
 import pyfuse3
-from mutagen.easyid3 import EasyID3
+from mediafile import MediaFile
 
 from beets import config
 from beets.plugins import BeetsPlugin as beetsplugin
 from beets.ui import Subcommand as subcommand
+from beets.util import sanitize_path
 
 beetfs_logger = logging.getLogger('beets')
 
@@ -102,7 +103,10 @@ class Beetfs(beetsplugin):
                     comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}"' for x in path_format])
                     comma_separated_columns += ', item_id, item_added'
                     # replace / with _ for unix path sanity
-                    values = [f'{item.evaluate_template(x).replace('/', '_')}' for x in path_format[:i]]
+                    values = [
+                        f'{sanitize_path(item.evaluate_template(x, True), lib.replacements)}'
+                        for x in path_format[:i]
+                    ]
                     # use '' instead of NULL to enable SQL UNIQUE
                     values.extend(['']*(len(path_format)-len(values)))
                     values.extend([str(item.get('id'))] if len(values) == len(path_format) else [''])
@@ -134,77 +138,12 @@ class Operations(pyfuse3.Operations):
     enable_writeback_cache = True
     def __init__(self, library):
         super().__init__()
-        # super(Operations, self).__init__()
         self.library = library
         self.next_inode = pyfuse3.ROOT_INODE + 1
         self.path_format = get_path_format()
         self.header_cache = {'modified': 0, 'header': '', 'beet_id': 0, 'header_len': 0}
         # TODO()
         # self.cache_lock = trio.Lock()
-
-    def get_id3_key(self, beet_key):
-        """wrapper function for mapping beets id3 keys to the id3 key names"""
-        key_map = {
-            'album':                'album',
-            'bpm':                  'bpm',
-            #'':                    'compilation',
-            'composer':             'composer',
-            #'':                    'copyright',
-            'encoder':              'encodedby',
-            'lyricist':             'lyricist',
-            'length':               'length',
-            'media':                'media',
-            #'':                    'mood',
-            'title':                'title',
-            #'':                    'version',
-            'artist':               'artist',
-            'albumartist':          'albumartist',
-            #'':                    'conductor',
-            'arranger':             'arranger',
-            'disc':                 'discnumber',
-            #'':                    'organization',
-            'track':                'tracknumber',
-            #'':                    'author',
-            'albumartist_sort':     'albumartistsort',
-            #'':                    'albumsort',
-            'composer_sort':        'composersort',
-            'artist_sort':          'artistsort',
-            #'':                    'titlesort',
-            #'':                    'isrc',
-            #'':                    'discsubtitle',
-            'language':             'language',
-            'genre':                'genre',
-            #'':                    'date',
-            #'':                    'originaldate',
-            #'':                    'performer:*',
-            'mb_trackid':           'musicbrainz_trackid',
-            #'':                    'website',
-            'rg_track_gain':        'replaygain_*_gain',
-            'rg_track_peak':        'replaygain_*_peak',
-            'mb_artistid':          'musicbrainz_artistid',
-            'mb_albumid':           'musicbrainz_albumid',
-            'mb_albumartistid':     'musicbrainz_albumartistid',
-            #'':                    'musicbrainz_trmid',
-            #'':                    'musicip_puid',
-            #'':                    'musicip_fingerprint',
-            'albumstatus':          'musicbrainz_albumstatus',
-            'albumtype':            'musicbrainz_albumtype',
-            'country':              'releasecountry',
-            #'':                    'musicbrainz_discid',
-            'asin':                 'asin',
-            #'':                    'performer',
-            #'':                    'barcode',
-            'catalognum':           'catalognumber',
-            'mb_releasetrackid':    'musicbrainz_releasetrackid',
-            'mb_releasegroupid':    'musicbrainz_releasegroupid',
-            'mb_workid':            'musicbrainz_workid',
-            'acoustid_fingerprint': 'acoustid_fingerprint',
-            'acoustid_id':          'acoustid_id'
-        }
-        try:
-            return key_map[beet_key]
-        except KeyError:
-            return None
 
     def beet_item_from_inode(self, inode):
         """fetches beets Item with inode"""
@@ -214,51 +153,50 @@ class Operations(pyfuse3.Operations):
         item = self.library.get_item(rows[0][0])
         return item
 
+    def create_general_header(self, item, filething):
+        """creates a header using MediaFile write"""
+        id3v23 = config["id3v23"].get(bool)
+        # only write media fields
+        item_tags = { k: v for k, v in item.items() if k in item._media_fields }  # pylint: disable=protected-access
+
+        mediafile = MediaFile(filething, id3v23=id3v23)
+        mediafile.update(item_tags)
+        filething.seek(0)
+        mediafile.save()
+        filething.seek(0)
+        return filething.read()
+
     def create_mp3_header(self, item):
         """creates the ID3 metadata for an mp3 file"""
-        header = BytesIO()
-        id3 = EasyID3()
-        for beet_tag in item.items(): # beets tags
-            key = self.get_id3_key(beet_tag[0])
-            if beet_tag[1] and key:
-                id3[key] = str(beet_tag[1])
-        id3.save(filething=header, padding=lambda x: 0)
-        return header.getvalue()
+        with open(item.path, 'rb') as f:
+            id3_header = f.read(10) # ID3 header is 10 bytes
+            # bytes 6-9 are tag size as a syncsafe integer
+            size = (id3_header[6] << 21 | id3_header[7] << 14 |
+                    id3_header[8] << 7  | id3_header[9])
+            id3_data = id3_header + f.read(size)
+            audio_frames = f.read(4096) # arbitrary number of frames for mutagen
+            filething = BytesIO(id3_data + audio_frames)
+        return self.create_general_header(item, filething)[:-4096] # remove fake frame data
 
-    def create_flac_header(self, item): # should we do this with mutagen?
+    def get_flac_metadata_blocks_size(self, filething):
+        """gets the size of the metadata blocks at the beginning of the source flac"""
+        filething.seek(4) # first 4 bytes are 'fLaC'
+        while True:
+            block_header_type = int(filething.read(1).hex(), 16)
+            length = int(filething.read(3).hex(), 16)
+            filething.seek(length, os.SEEK_CUR)
+            if block_header_type & 128 != 0:
+                break
+        return filething.tell()
+
+    def create_flac_header(self, item):
         """creates the vorbis comments metadata for a flac file"""
-        sections = {}
-        with open(item.path, 'rb') as bfile:
-            cursor = 4 # first 4 bytes are 'fLaC'
-            done = False
-            while not done:
-                bfile.seek(cursor)
-                block_header_type = int(bfile.read(1).hex(), 16)
-                length = int(bfile.read(3).hex(), 16)
-                sections[block_header_type & 127] = bfile.read(length)
-                cursor += 4 + length
-                done = block_header_type & 128 != 0
-        vorbis_comment = b''
-        field_len = 0
-        for beet_tag in item.items():
-            if beet_tag[1]:
-                field_len += 1
-                line = bytes(beet_tag[0].upper() + '=' + str(beet_tag[1]), 'utf-8')
-                line = len(line).to_bytes(4, 'little') + line
-                vorbis_comment += line
-        vorbis_comment = field_len.to_bytes(4, 'little') + vorbis_comment
-        vorbis_comment = b'\x05\x00\x00\x00beets' + vorbis_comment # 'beets' vendor string
-        sections[4] = vorbis_comment # VORBIS_COMMENT
-        header = b'fLaC' # beginning of flac header
-        for section in sorted(list(sections.keys())): # sort to get STREAMINFO first
-            if section == 1: # padding
-                continue
-            header += section.to_bytes(1, 'big') + len(sections[section]).to_bytes(3, 'big')
-            header += bytes(sections[section])
-        flac_padding = 2048
-        header += b'\x81' + flac_padding.to_bytes(3, 'big')
-        header += b'\x00' * flac_padding
-        return header
+        with open(item.path, 'rb') as f:
+            header_size = self.get_flac_metadata_blocks_size(f)
+            f.seek(0)
+            filething = BytesIO(f.read(header_size))
+        ret = self.create_general_header(item, filething)
+        return ret
 
     def create_header(self, item):
         """chooses which metadata to create based on format reported by beets"""
@@ -281,11 +219,10 @@ class Operations(pyfuse3.Operations):
                 ssint = bfile.read(4)
                 size = ssint[3] | ssint[2] << 7 | ssint[1] << 14 | ssint[0] << 21 # remove sync bits
                 return size + 10
-            elif beginning[0] == 0xFF and beginning[1] & 0xE0 == 0xE0: # MPEG frame sync
+            if beginning[0] == 0xFF and beginning[1] & 0xE0 == 0xE0: # MPEG frame sync
                 # beginning & 0xFFE000 == 0xFFE000, tfw working with bits in python
                 return 0
-            else:
-                raise RuntimeError(f"What is this? {beginning}")
+            raise RuntimeError(f"What is this? {beginning}")
 
     def find_flac_data_start(self, item):
         """finds the offset in a source flac where the audio frames begin"""

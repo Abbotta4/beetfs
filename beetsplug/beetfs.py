@@ -13,6 +13,7 @@ from mediafile import MediaFile
 from beets import config
 from beets.plugins import BeetsPlugin as beetsplugin
 from beets.ui import Subcommand as subcommand
+from beets.util import sanitize_path
 
 beetfs_logger = logging.getLogger('beets')
 
@@ -72,7 +73,10 @@ def replace_inode_table(lib, paths): # pylint: disable=unused-argument
                 comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}"' for x in path_format])
                 comma_separated_columns += ', item_id, item_added'
                 # replace / with _ for unix path sanity
-                values = [f'{item.evaluate_template(x).replace('/', '_')}' for x in path_format[:i]]
+                values = [
+                    f'{sanitize_path(item.evaluate_template(x, True), lib.replacements)}'
+                    for x in path_format[:i]
+                ]
                 # use '' instead of NULL to enable SQL UNIQUE
                 values.extend(['']*(len(path_format)-len(values)))
                 values.extend([str(item.get('id'))] if len(values) == len(path_format) else [''])

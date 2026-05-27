@@ -351,16 +351,17 @@ class Operations(pyfuse3.Operations):
             query = f'SELECT inode, item_id, "{col}" FROM {self.table} WHERE {where_clause} AND "{col}" != ?'
             beetfs_logger.debug('{} {}', query, where_clause_list[1::2] + [''])
             rows = tx.query(query, tuple(where_clause_list[1::2] + ['']))
-        if start_id >= len(rows):
-            return
-        entry = await self.getattr(rows[start_id][0])
-        # TODO() store the result here and manage lookup count
-        reply_name = rows[start_id][2]
-        if depth == len(self.path_format)-1:
-            item = self.library.get_item(rows[start_id][1])
-            # reply_name += os.path.splitext(item.path)[-1].decode('utf-8') # add extension
-            reply_name += f'.{item.format.lower()}'
-        pyfuse3.readdir_reply(token, bytes(reply_name, encoding='utf-8'), entry, start_id + 1)
+        for idx, row in enumerate(rows):
+            if idx < start_id:
+                continue
+            entry = await self.getattr(row[0])
+            # TODO() store the result here and manage lookup count
+            reply_name = row[2]
+            if depth == len(self.path_format)-1: # beet item
+                item = self.library.get_item(row[1])
+                reply_name += f'.{item.format.lower()}'
+            if not pyfuse3.readdir_reply(token, bytes(reply_name, encoding='utf-8'), entry, idx + 1):
+                return # token buffer full
 
     async def open(self, inode, flags, ctx):
         """FUSE API implementation for 'open file'"""

@@ -1,12 +1,24 @@
 # beetfs
 
-beetfs takes a single config option for building the directory structure of your beets filesystem. The format is the same that is used in `paths`:
+beetfs mounts a FUSE that provides all your music with the desired tags and metadata applied to the files without touching the actual files underneath.
+
+beetfs takes a config option for building the directory structure of your beets filesystem. The format is the same that is used in `paths`:
 ```
 beetfs:
     path_format: %first{$albumartist}/$album ($year)/$track $title
 ```
 
-To mount the filsystem, simply give the mountpoint as an argument to `beet mount`, e.g. `beet mount ~/Music/beetfs`.
+To mount the filsystem, simply give the mountpoint as an argument to `beet mount`, e.g. `beet mount ~/Music/beetfs`. A beets query can optionally be passed with `-q` to filter the database, e.g. `beet mount -q 'soundtrack:1 ~/Music/Soundtracks`
+
+One or more mountpoints can be specified in the config file with beets queries and will be mounted with just `beet mount`:
+```
+beetfs:
+    path_format: %first{$albumartist}/$album ($year)/$track $title
+    mounts:
+        /home/foo/beets/bmnt:
+        /home/foo/beets/soundtracks: soundtrack:1
+        /home/foo/beets/music: soundtrack:0
+```
 
 ## Install
 

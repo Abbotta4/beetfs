@@ -406,7 +406,7 @@ logging-format-style=new
 
 # Logging modules to check that the string format arguments are in logging
 # function parameter format.
-logging-modules=logging
+logging-modules=logging,beetfs_logger
 
 
 [MESSAGES CONTROL]
